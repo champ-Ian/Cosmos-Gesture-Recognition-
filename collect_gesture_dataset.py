@@ -8,9 +8,12 @@ run several sensors concurrently on independent background threads:
 
     - mmWave radar (TI xWRL6432): binary UART frames, decoded with
       `mmwave/radar_io.py` (adapted from mmwave_lab).
-    - IMU (ESP32 Core2), UWB (x3), RFID reader: newline-delimited serial text,
-      read raw by `sensors/serial_json_stream.py` (see that file for the
+    - IMU (ESP32 Core2), RFID reader: newline-delimited serial text, read raw
+      by `sensors/serial_json_stream.py` (see that file for the
       expected/recommended JSON-line firmware contract).
+    - UWB: a Qorvo DWM3001CDK controller+controlee FiRa ranging pair, driven
+      by `uwb/uwb_stream.py` (adapted from `UWB_lab`). This needs two serial
+      ports (`--uwb-controller-port` / `--uwb-controlee-port`), not one.
 
 Every enabled sensor streams continuously into its own timestamped buffer.
 For each trial, the script records a wall-clock window (`--duration` seconds)
@@ -29,7 +32,9 @@ Example (all four sensors):
         --collector student01 \\
         --mmwave-port /dev/cu.usbserial-XXXX \\
         --imu-port /dev/cu.usbserial-YYYY \\
-        --uwb-port /dev/cu.usbserial-ZZZZ \\
+        --uwb-controller-port /dev/cu.usbmodemZZZZ \\
+        --uwb-controlee-port /dev/cu.usbmodemWWWW \\
+        --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
         --rfid-port /dev/cu.usbserial-WWWW \\
         --gesture pull,push,clockwise,anti_clockwise \\
         --trials 5 --duration 4
@@ -52,6 +57,7 @@ from gestures import GESTURES, normalize_gestures
 from mmwave.mmwave_stream import MmwaveStream
 from sensors.common import append_manifest, now_text, safe_label, timestamp, write_json
 from sensors.serial_json_stream import SerialLineStream
+from uwb.uwb_stream import UwbStream
 
 DEFAULT_MMWAVE_CFG = Path("mmwave/xwrL64xx-evm/near_field_hand_50cm.cfg")
 
@@ -68,7 +74,8 @@ MANIFEST_FIELDNAMES = [
     "mmwave_frame_count",
     "mmwave_mean_frame_rate_hz",
     "imu_line_count",
-    "uwb_line_count",
+    "uwb_sample_count",
+    "uwb_ok_sample_count",
     "rfid_line_count",
     "npz_path",
     "session_dir",
@@ -107,7 +114,13 @@ def parse_args() -> argparse.Namespace:
         "--min-sensor-lines",
         type=int,
         default=5,
-        help="Minimum raw lines required per enabled IMU/UWB/RFID sensor to keep a trial.",
+        help="Minimum raw lines required per enabled IMU/RFID sensor to keep a trial.",
+    )
+    parser.add_argument(
+        "--min-uwb-samples",
+        type=int,
+        default=5,
+        help="Minimum Ok range samples required from UWB, if enabled, to keep a trial.",
     )
 
     mmwave_group = parser.add_argument_group("mmWave radar (TI xWRL6432)")
@@ -120,9 +133,29 @@ def parse_args() -> argparse.Namespace:
     imu_group.add_argument("--imu-port", help="IMU serial port.")
     imu_group.add_argument("--imu-baud", type=int, default=115200)
 
-    uwb_group = parser.add_argument_group("UWB")
-    uwb_group.add_argument("--uwb-port", help="UWB tag serial port (aggregated anchor ranges).")
-    uwb_group.add_argument("--uwb-baud", type=int, default=115200)
+    uwb_group = parser.add_argument_group("UWB (Qorvo DWM3001CDK FiRa TWR pair)")
+    uwb_group.add_argument("--uwb-controller-port", help="UWB controller/initiator serial port.")
+    uwb_group.add_argument("--uwb-controlee-port", help="UWB controlee/responder serial port.")
+    uwb_group.add_argument(
+        "--uwb-group-id", type=int, help="Class-sheet group number (required if UWB is enabled)."
+    )
+    uwb_group.add_argument(
+        "--uwb-preamble-code",
+        type=int,
+        default=10,
+        help="Sheet-assigned FiRa preamble code (one of 9, 10, 11, 12).",
+    )
+    uwb_group.add_argument(
+        "--uwb-channel", type=int, choices=[5, 9], default=9, help="Sheet-assigned UWB channel."
+    )
+    uwb_group.add_argument("--uwb-fps", type=float, default=50.0, help="Target ranging update rate.")
+    uwb_group.add_argument("--uwb-slot-span", type=int, default=2400)
+    uwb_group.add_argument("--uwb-slots-per-rr", type=int, default=6)
+    uwb_group.add_argument(
+        "--uwb-skip-device-reset",
+        action="store_true",
+        help="Skip the UCI device reset before/after ranging (use if it's already known-good).",
+    )
 
     rfid_group = parser.add_argument_group("RFID")
     rfid_group.add_argument("--rfid-port", help="RFID reader serial port.")
@@ -158,8 +191,16 @@ class SensorSet:
     def __init__(self, args: argparse.Namespace) -> None:
         self.mmwave: MmwaveStream | None = None
         self.imu: SerialLineStream | None = None
-        self.uwb: SerialLineStream | None = None
+        self.uwb: UwbStream | None = None
         self.rfid: SerialLineStream | None = None
+
+        if bool(args.uwb_controller_port) != bool(args.uwb_controlee_port):
+            raise SystemExit(
+                "UWB needs both --uwb-controller-port and --uwb-controlee-port "
+                "(it's a controller+controlee ranging pair, not a single tag)."
+            )
+        if args.uwb_controller_port and args.uwb_group_id is None:
+            raise SystemExit("--uwb-group-id is required when UWB is enabled.")
 
         try:
             if args.mmwave_port:
@@ -173,9 +214,25 @@ class SensorSet:
             if args.imu_port:
                 print(f"Opening IMU on {args.imu_port}...")
                 self.imu = SerialLineStream("imu", args.imu_port, args.imu_baud)
-            if args.uwb_port:
-                print(f"Opening UWB on {args.uwb_port}...")
-                self.uwb = SerialLineStream("uwb", args.uwb_port, args.uwb_baud)
+            if args.uwb_controller_port:
+                print(
+                    f"Opening UWB ranging pair (controller {args.uwb_controller_port}, "
+                    f"controlee {args.uwb_controlee_port})..."
+                )
+                self.uwb = UwbStream(
+                    controller_port=args.uwb_controller_port,
+                    controlee_port=args.uwb_controlee_port,
+                    group_id=args.uwb_group_id,
+                    log_dir=Path(args.out_root).expanduser().resolve()
+                    / args.dataset_name
+                    / "uwb_logs",
+                    preamble_code=args.uwb_preamble_code,
+                    channel=args.uwb_channel,
+                    fps=args.uwb_fps,
+                    slot_span=args.uwb_slot_span,
+                    slots_per_rr=args.uwb_slots_per_rr,
+                    reset_devices_first=not args.uwb_skip_device_reset,
+                )
             if args.rfid_port:
                 print(f"Opening RFID on {args.rfid_port}...")
                 self.rfid = SerialLineStream("rfid", args.rfid_port, args.rfid_baud)
@@ -187,7 +244,7 @@ class SensorSet:
             self.close()
             raise SystemExit(
                 "No sensors enabled. Pass at least one of --mmwave-port, --imu-port, "
-                "--uwb-port, --rfid-port."
+                "--uwb-controller-port/--uwb-controlee-port, --rfid-port."
             )
 
         # Let boards settle and start producing data before the first trial.
@@ -217,7 +274,7 @@ class SensorSet:
         if self.imu is not None:
             parts.append(f"imu={self.imu.line_count}L")
         if self.uwb is not None:
-            parts.append(f"uwb={self.uwb.line_count}L")
+            parts.append(f"uwb={self.uwb.sample_count}samples")
         if self.rfid is not None:
             parts.append(f"rfid={self.rfid.line_count}L")
         return " ".join(parts)
@@ -255,14 +312,16 @@ def capture_trial(sensors: SensorSet, duration_s: float) -> tuple[float, float]:
     return start, time.monotonic()
 
 
-def trial_ok(sensors: SensorSet, args: argparse.Namespace, mmwave_data, imu_lines, uwb_lines, rfid_lines) -> str | None:
+def trial_ok(sensors: SensorSet, args: argparse.Namespace, mmwave_data, imu_lines, uwb_window, rfid_lines) -> str | None:
     """Return None if the trial meets minimum-sample thresholds, else a reason string."""
     if sensors.mmwave is not None and len(mmwave_data["frame_number"]) < args.min_mmwave_frames:
         return f"only {len(mmwave_data['frame_number'])} mmWave frames (need {args.min_mmwave_frames})"
     if sensors.imu is not None and len(imu_lines) < args.min_sensor_lines:
         return f"only {len(imu_lines)} IMU lines (need {args.min_sensor_lines})"
-    if sensors.uwb is not None and len(uwb_lines) < args.min_sensor_lines:
-        return f"only {len(uwb_lines)} UWB lines (need {args.min_sensor_lines})"
+    if sensors.uwb is not None:
+        ok_count = int(np.count_nonzero(uwb_window["status"] == "Ok"))
+        if ok_count < args.min_uwb_samples:
+            return f"only {ok_count} Ok UWB range samples (need {args.min_uwb_samples})"
     if sensors.rfid is not None and len(rfid_lines) < args.min_sensor_lines:
         return f"only {len(rfid_lines)} RFID lines (need {args.min_sensor_lines})"
     return None
@@ -279,7 +338,7 @@ def save_trial(
     trial_end: float,
     mmwave_data,
     imu_lines: list[tuple[float, str]],
-    uwb_lines: list[tuple[float, str]],
+    uwb_window: dict,
     rfid_lines: list[tuple[float, str]],
     started_at: str,
     finished_at: str,
@@ -325,9 +384,17 @@ def save_trial(
     if sensors.imu is not None:
         payload["imu_recv_time_s"] = np.array([t for t, _ in imu_lines], dtype=float)
         payload["imu_raw_lines"] = np.array([line for _, line in imu_lines], dtype=object)
+    uwb_ok_count = 0
     if sensors.uwb is not None:
-        payload["uwb_recv_time_s"] = np.array([t for t, _ in uwb_lines], dtype=float)
-        payload["uwb_raw_lines"] = np.array([line for _, line in uwb_lines], dtype=object)
+        uwb_ok_count = int(np.count_nonzero(uwb_window["status"] == "Ok"))
+        payload.update(
+            {
+                "uwb_time_s": uwb_window["time_s"],
+                "uwb_sequence": uwb_window["sequence"],
+                "uwb_status": uwb_window["status"],
+                "uwb_distance_cm": uwb_window["distance_cm"],
+            }
+        )
     if sensors.rfid is not None:
         payload["rfid_recv_time_s"] = np.array([t for t, _ in rfid_lines], dtype=float)
         payload["rfid_raw_lines"] = np.array([line for _, line in rfid_lines], dtype=object)
@@ -347,7 +414,8 @@ def save_trial(
         "mmwave_frame_count": mmwave_frame_count,
         "mmwave_mean_frame_rate_hz": mmwave_mean_fps,
         "imu_line_count": len(imu_lines),
-        "uwb_line_count": len(uwb_lines),
+        "uwb_sample_count": int(len(uwb_window["time_s"])) if sensors.uwb is not None else 0,
+        "uwb_ok_sample_count": uwb_ok_count,
         "rfid_line_count": len(rfid_lines),
         "npz_path": str(npz_path),
         "session_dir": str(session_dir),
@@ -376,9 +444,23 @@ def make_dataset_metadata(args: argparse.Namespace, gesture_list: list[str], sen
         "ports": {
             "mmwave": args.mmwave_port,
             "imu": args.imu_port,
-            "uwb": args.uwb_port,
+            "uwb_controller": args.uwb_controller_port,
+            "uwb_controlee": args.uwb_controlee_port,
             "rfid": args.rfid_port,
         },
+        "uwb_config": (
+            {
+                "group_id": args.uwb_group_id,
+                "preamble_code": args.uwb_preamble_code,
+                "channel": args.uwb_channel,
+                "fps": args.uwb_fps,
+                "ranging_span_ms": sensors.uwb.ranging_span_ms,
+                "slot_span": args.uwb_slot_span,
+                "slots_per_rr": args.uwb_slots_per_rr,
+            }
+            if sensors.uwb is not None
+            else None
+        ),
         "created_at": now_text(),
     }
 
@@ -420,10 +502,10 @@ def main() -> int:
 
                     mmwave_data = sensors.mmwave.window(trial_start, trial_end) if sensors.mmwave else None
                     imu_lines = sensors.imu.window(trial_start, trial_end) if sensors.imu else []
-                    uwb_lines = sensors.uwb.window(trial_start, trial_end) if sensors.uwb else []
+                    uwb_window = sensors.uwb.window(trial_start, trial_end) if sensors.uwb else {}
                     rfid_lines = sensors.rfid.window(trial_start, trial_end) if sensors.rfid else []
 
-                    reject_reason = trial_ok(sensors, args, mmwave_data, imu_lines, uwb_lines, rfid_lines)
+                    reject_reason = trial_ok(sensors, args, mmwave_data, imu_lines, uwb_window, rfid_lines)
                     if reject_reason is not None:
                         print(f"Discarded: {reject_reason}.")
                         attempt_index += 1
@@ -443,7 +525,7 @@ def main() -> int:
                             trial_end,
                             mmwave_data,
                             imu_lines,
-                            uwb_lines,
+                            uwb_window,
                             rfid_lines,
                             started_at,
                             finished_at,

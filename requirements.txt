@@ -2,3 +2,7 @@ numpy
 pyserial
 matplotlib
 scikit-learn
+
+# uwb/uwb-qorvo-tools (Qorvo FiRa TWR CLI, vendored from UWB_lab)
+colorama
+toml
