@@ -77,7 +77,22 @@ def twr_command(
     channel: int = 9,
     controlee: bool = False,
     stats: bool = True,
+    node_mode: str = "unicast",
+    n_controlees: int = 1,
+    mac: str | None = None,
+    dest_mac: str | None = None,
 ) -> list[str]:
+    """Build a `run_fira_twr.py` invocation.
+
+    `node_mode="onetomany"` plus `n_controlees` > 1 is FiRa's multi-node
+    ranging mode: one controller (here, the worn tag) ranges against several
+    controlees (here, the fixed anchors) within a single MAC round, using
+    `mac`/`dest_mac` to address each side. This mode is exercised by the
+    vendored CLI's own `--node`/`--n_controlees`/`--mac`/`--dest-mac` flags,
+    but is **not** what `UWB_lab`'s single controller/controlee lab exercises
+    -- treat it as unverified against real DWM3001CDK hardware until you've
+    smoke-tested it (short `--stats` run) yourself.
+    """
     cmd = [
         python_exe,
         "-u",
@@ -103,6 +118,14 @@ def twr_command(
         cmd.append("--controlee")
     if stats:
         cmd.append("--stats")
+    if node_mode != "unicast":
+        cmd.extend(["--node", node_mode])
+    if n_controlees != 1:
+        cmd.extend(["--n_controlees", str(n_controlees)])
+    if mac is not None:
+        cmd.extend(["--mac", mac])
+    if dest_mac is not None:
+        cmd.extend(["--dest-mac", dest_mac])
     return cmd
 
 
@@ -166,14 +189,27 @@ class RangeSample:
     status: str
     status_code: str
     distance_cm: float
+    mac_address: str
 
 
 class RangeLogParser:
-    """Incrementally parses `run_fira_twr.py --stats` controller stdout lines."""
+    """Incrementally parses `run_fira_twr.py --stats` controller stdout lines.
+
+    Each ranging round prints one `sequence n:` / `ranging interval:` line
+    followed by one `# Measurement <i>:` block per controlee (one block for a
+    plain unicast controller<->controlee pair, several blocks in
+    `--node onetomany` mode), each with its own `status:`, `mac address:`,
+    and `distance:` lines in that order (see
+    `uwb-qorvo-tools/lib/uwb-uci/uci/qorvo_msg.py`'s `RangingTwrData.__str__`).
+    `mac_address` is what tells samples from different anchors apart in
+    one-to-many mode; it's parsed as the raw hex string printed by the
+    device and not otherwise validated.
+    """
 
     sequence_re = re.compile(r"sequence n:\s*(\d+)")
     interval_re = re.compile(r"ranging interval:\s*([0-9.]+)\s*ms")
     status_re = re.compile(r"status:\s*([A-Za-z0-9_]+)\s*\((0x[0-9a-fA-F]+)\)")
+    mac_re = re.compile(r"mac address:\s*([0-9a-fA-F:]+)\s*hex")
     distance_re = re.compile(r"distance:\s*([-+]?[0-9]*\.?[0-9]+)\s*cm")
 
     def __init__(self) -> None:
@@ -181,6 +217,7 @@ class RangeLogParser:
         self.interval_ms: float | None = None
         self.status: str | None = None
         self.status_code: str | None = None
+        self.mac_address: str | None = None
 
     def feed(self, line: str) -> RangeSample | None:
         match = self.sequence_re.search(line)
@@ -188,6 +225,7 @@ class RangeLogParser:
             self.sequence = int(match.group(1))
             self.status = None
             self.status_code = None
+            self.mac_address = None
             return None
 
         match = self.interval_re.search(line)
@@ -201,6 +239,11 @@ class RangeLogParser:
             self.status_code = match.group(2)
             return None
 
+        match = self.mac_re.search(line)
+        if match:
+            self.mac_address = match.group(1)
+            return None
+
         match = self.distance_re.search(line)
         if match:
             sample = RangeSample(
@@ -209,9 +252,11 @@ class RangeLogParser:
                 status=self.status or "unknown",
                 status_code=self.status_code or "",
                 distance_cm=float(match.group(1)),
+                mac_address=self.mac_address or "",
             )
             self.status = None
             self.status_code = None
+            self.mac_address = None
             return sample
 
         return None
