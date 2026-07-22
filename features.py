@@ -12,14 +12,14 @@ vector (early fusion) or a per-sensor dict (late fusion).
 
 These are starter/baseline features, the same way UWB_lab ships baseline
 range features and leaves a `_proposal` extractor as a TODO for students --
-expect to replace or extend these once you've looked at your own data,
-especially IMU/RFID (the JSON-line schema is whatever your group's firmware
-actually prints; adjust `_parse_json_lines` field names to match).
+expect to replace or extend these once you've looked at your own data.
+IMU parses `IMU_lab_students`' `accel[g].../gyro[dps]...` log lines; RFID
+parses `RFID_Lab`'s `<EPC> <timestamp> <RSSI> <read_count>` report lines --
+neither is JSON, despite what earlier revisions of this repo assumed.
 """
 from __future__ import annotations
 
-import json
-import math
+import re
 
 import numpy as np
 
@@ -162,30 +162,17 @@ def extract_uwb_features(npz) -> list[float] | None:
 
 
 # ---------------------------------------------------------------------------
-# IMU / RFID: best-effort JSON-line parsing
+# IMU: ESP32 + BMI270 (IMU_lab_students firmware) log-line parsing
 # ---------------------------------------------------------------------------
 
-
-def _parse_json_lines(raw_lines) -> list[dict]:
-    records = []
-    for line in raw_lines:
-        try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
-
-
-def _numeric_field(records: list[dict], field: str) -> np.ndarray:
-    values = []
-    for record in records:
-        value = record.get(field)
-        if isinstance(value, (int, float)) and math.isfinite(value):
-            values.append(float(value))
-    return np.array(values, dtype=float)
-
+# Real firmware output (see IMU_lab_students/main/main.c, README.md):
+#   accel[g] x= 0.012 y=-0.034 z= 0.998 | gyro[dps] x= 0.10 y=-0.20 z= 0.05
+# Plain ESP_LOGI text, not JSON.
+_FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+_IMU_SAMPLE_RE = re.compile(
+    rf"accel\[g\]\s+x=\s*({_FLOAT_RE})\s+y=\s*({_FLOAT_RE})\s+z=\s*({_FLOAT_RE})"
+    rf"\s+\|\s+gyro\[dps\]\s+x=\s*({_FLOAT_RE})\s+y=\s*({_FLOAT_RE})\s+z=\s*({_FLOAT_RE})"
+)
 
 IMU_AXES = ("ax", "ay", "az", "gx", "gy", "gz")
 IMU_FEATURE_NAMES = ["imu_line_count", "imu_record_count"]
@@ -194,77 +181,116 @@ for _axis in IMU_AXES:
 IMU_FEATURE_NAMES += ["imu_accel_mag_mean", "imu_accel_mag_std"]
 
 
-def extract_imu_features(npz) -> list[float] | None:
-    """Assumes the recommended firmware JSON schema (see sensors/serial_json_stream.py).
+def _parse_imu_lines(raw_lines) -> np.ndarray:
+    """Parse `accel[g] ... | gyro[dps] ...` lines into an (n, 6) [ax,ay,az,gx,gy,gz] array."""
+    rows = []
+    for line in raw_lines:
+        match = _IMU_SAMPLE_RE.search(line)
+        if match:
+            rows.append([float(value) for value in match.groups()])
+    return np.array(rows, dtype=float) if rows else np.zeros((0, 6))
 
-    If your firmware prints something else, this will return all-zero axis
-    stats (not crash) -- rewrite the field names below to match your actual
-    JSON keys, or write your own extractor and register it in FEATURE_SPECS.
+
+def extract_imu_features(npz) -> list[float] | None:
+    """Parses the IMU_lab_students BMI270 firmware's `accel[g].../gyro[dps]...` text lines.
+
+    If your group's firmware prints something else, update `_IMU_SAMPLE_RE`
+    (or write your own extractor and register it in FEATURE_SPECS).
     """
     raw_lines = npz["imu_raw_lines"]
     line_count = len(raw_lines)
     if line_count == 0:
         return None
 
-    records = _parse_json_lines(raw_lines)
-    if len(records) < 2:
+    samples = _parse_imu_lines(raw_lines)
+    if len(samples) < 2:
         return None
 
-    features = [float(line_count), float(len(records))]
-    axis_values = {}
-    for axis in IMU_AXES:
-        values = _numeric_field(records, axis)
-        axis_values[axis] = values
-        if len(values) == 0:
-            features += [0.0, 0.0, 0.0, 0.0]
-        else:
-            features += [
-                float(np.mean(values)),
-                float(np.std(values)) if len(values) > 1 else 0.0,
-                float(np.min(values)),
-                float(np.max(values)),
-            ]
+    features = [float(line_count), float(len(samples))]
+    for i in range(6):
+        values = samples[:, i]
+        features += [
+            float(np.mean(values)),
+            float(np.std(values)) if len(values) > 1 else 0.0,
+            float(np.min(values)),
+            float(np.max(values)),
+        ]
 
-    ax, ay, az = axis_values["ax"], axis_values["ay"], axis_values["az"]
-    n = min(len(ax), len(ay), len(az))
-    if n == 0:
-        features += [0.0, 0.0]
-    else:
-        magnitude = np.sqrt(ax[:n] ** 2 + ay[:n] ** 2 + az[:n] ** 2)
-        features += [float(np.mean(magnitude)), float(np.std(magnitude)) if n > 1 else 0.0]
+    ax, ay, az = samples[:, 0], samples[:, 1], samples[:, 2]
+    magnitude = np.sqrt(ax**2 + ay**2 + az**2)
+    features += [float(np.mean(magnitude)), float(np.std(magnitude)) if len(magnitude) > 1 else 0.0]
 
     return features
 
 
-RFID_FEATURE_NAMES = ["rfid_line_count", "rfid_record_count", "rfid_unique_tag_count", "rfid_rssi_mean", "rfid_rssi_std", "rfid_rssi_min", "rfid_rssi_max"]
+# ---------------------------------------------------------------------------
+# RFID: RFID_Lab reader log-line parsing (TCP, not serial)
+# ---------------------------------------------------------------------------
+
+# Real reader output (see RFID_Lab/rfid_log_utils.py): space-separated
+#   <EPC> <timestamp (one or more tokens)> <RSSI> <read_count>
+# e.g. "E2806995000040154D38514E 2024-01-01 12:00:00.123 -45 3"
+
+
+def _parse_rfid_lines(raw_lines) -> list[tuple[str, int, int]]:
+    """Parse RFID_Lab report lines into (epc, rssi, read_count) tuples."""
+    records = []
+    for line in raw_lines:
+        parts = str(line).strip().split()
+        if len(parts) < 5:
+            continue
+        try:
+            rssi = int(parts[-2])
+            read_count = int(parts[-1])
+        except ValueError:
+            continue
+        records.append((parts[0], rssi, read_count))
+    return records
+
+
+RFID_FEATURE_NAMES = [
+    "rfid_line_count",
+    "rfid_record_count",
+    "rfid_unique_tag_count",
+    "rfid_rssi_mean",
+    "rfid_rssi_std",
+    "rfid_rssi_min",
+    "rfid_rssi_max",
+    "rfid_read_count_sum",
+]
 
 
 def extract_rfid_features(npz) -> list[float] | None:
-    """Assumes the recommended firmware JSON schema (see sensors/serial_json_stream.py)."""
+    """Baseline RFID features: pools every tag read in the trial window together.
+
+    The reader streams a line for every EPC it sees, not just tags you care
+    about. This pools all of them -- if your gestures use specific tags
+    (e.g. one per finger for Soli-style sensing), filter `_parse_rfid_lines()`
+    output by EPC first and compute per-tag features instead.
+    """
     raw_lines = npz["rfid_raw_lines"]
     line_count = len(raw_lines)
     if line_count == 0:
         return None
 
-    records = _parse_json_lines(raw_lines)
+    records = _parse_rfid_lines(raw_lines)
     if len(records) < 2:
         return None
 
-    tag_ids = {record.get("tag_id") for record in records if record.get("tag_id")}
-    rssi = _numeric_field(records, "rssi")
+    tag_ids = {epc for epc, _, _ in records}
+    rssi = np.array([rssi for _, rssi, _ in records], dtype=float)
+    read_count_sum = float(sum(read_count for _, _, read_count in records))
 
-    features = [float(line_count), float(len(records)), float(len(tag_ids))]
-    if len(rssi) == 0:
-        features += [0.0, 0.0, 0.0, 0.0]
-    else:
-        features += [
-            float(np.mean(rssi)),
-            float(np.std(rssi)) if len(rssi) > 1 else 0.0,
-            float(np.min(rssi)),
-            float(np.max(rssi)),
-        ]
-
-    return features
+    return [
+        float(line_count),
+        float(len(records)),
+        float(len(tag_ids)),
+        float(np.mean(rssi)),
+        float(np.std(rssi)) if len(rssi) > 1 else 0.0,
+        float(np.min(rssi)),
+        float(np.max(rssi)),
+        read_count_sum,
+    ]
 
 
 # ---------------------------------------------------------------------------

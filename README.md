@@ -18,9 +18,9 @@ your own recorded data.
 | Sensor | Role |
 | --- | --- |
 | mmWave radar (TI xWRL6432/IWR6432, from `mmwave_lab`) | Range profile + point cloud of arm/hand motion. |
-| IMU (ESP32 Core2) | Wrist/hand-worn accelerometer + gyroscope. |
+| IMU (ESP32 Core2 + BMI270, from `IMU_lab_students`) | Wrist/hand-worn accelerometer + gyroscope. |
 | UWB (3x Qorvo DWM3001CDK, from `UWB_lab`) | FiRa two-way-ranging distance from 1 fixed anchor to 2 worn nodes (one per wrist/arm). |
-| RFID reader + tags | Near-field hand/finger sensing (Soli-style micro-gestures, fist open/close). |
+| RFID reader + tags (from `RFID_Lab`) | Near-field hand/finger sensing (Soli-style micro-gestures, fist open/close). |
 
 Not every gesture needs every sensor — see `gestures.py` for the
 suggested sensor combination per gesture (also printed as a prompt during
@@ -61,30 +61,52 @@ the first 50 cm — good for hand/arm gestures directly in front of the board.
 Use `--mmwave-cfg` to point at a different `.cfg` (e.g. `point_cloud.cfg` for
 a wider field of view) if a gesture needs more range.
 
-### IMU / RFID firmware contract
+### IMU wiring (ESP32 + BMI270, `IMU_lab_students` firmware)
 
-This repo does not include ESP32 firmware — that is built separately per
-group. The collector treats these two boards generically: it just reads
-**newline-terminated text lines** from each serial port and timestamps them
-on arrival (see `sensors/serial_json_stream.py`). Nothing is parsed or
-dropped at collection time, so firmware can keep changing without
-re-collecting data.
+The IMU board is a USB serial device (`--imu-port`, default baud 115200).
+The collector reads **newline-terminated raw text lines** and timestamps
+them on arrival (see `sensors/serial_json_stream.py`); nothing is parsed at
+collection time, so firmware changes don't force a recollect.
 
-Recommended (not required) firmware output — one JSON object per line:
+The actual firmware (`IMU_lab_students/main/main.c`) prints one line per
+sample, not JSON:
 
 ```text
-IMU:  {"t_ms": 12345, "ax": 0.01, "ay": 0.98, "az": 0.03, "gx": 1.2, "gy": -0.3, "gz": 0.1}
-RFID: {"t_ms": 12345, "tag_id": "E200...", "rssi": -41.5}
+accel[g] x= 0.012 y=-0.034 z= 0.998 | gyro[dps] x= 0.10 y=-0.20 z= 0.05
 ```
 
-If your firmware prints CSV or something else, that's fine — the raw line is
-stored either way. Feature extraction (parsing these lines into numeric
-arrays for training) is a separate step once your team locks in the actual
-line format; it only needs to change a parser, not recollect data.
+`features.py`'s `extract_imu_features()` parses exactly this format. If your
+group's firmware prints something else, update the `_IMU_SAMPLE_RE` regex at
+the top of `features.py`'s IMU section to match -- the raw line is always
+stored either way, so this only means re-running feature extraction, not
+recollecting data.
+
+### RFID wiring (`RFID_Lab` reader, TCP -- not serial)
+
+Unlike every other sensor here, the RFID reader is **not a USB serial
+device** -- it's a network device that streams tag reads over a **TCP
+socket**, same as `RFID_Lab/reading_from_TCP.py` / `touch_detector_gui.py`.
+Connect your laptop to the reader's network (its default address is
+`192.168.137.1:9055`) before collecting; `sensors/rfid_tcp_stream.py` opens
+that socket instead of a serial port. Enable it with `--rfid` (override the
+address with `--rfid-host`/`--rfid-tcp-port` if needed).
+
+The reader prints one line per tag read, for every tag it sees (not just
+ones you care about):
+
+```text
+E2806995000040154D38514E 2024-01-01 12:00:00.123 -45 3
+```
+
+`<EPC> <timestamp> <RSSI> <read_count>`, space-separated (see
+`RFID_Lab/rfid_log_utils.py`). `features.py`'s `extract_rfid_features()`
+pools every tag read in the trial window into one feature vector by
+default; if your gestures use specific tags (e.g. Soli-style one-tag-per-
+finger sensing), filter by EPC first for per-tag features instead.
 
 ### UWB wiring (Qorvo DWM3001CDK FiRa ranging: anchor + node(s))
 
-Unlike IMU/RFID, the UWB kit is **not** a single JSON-line tag: it's the same
+Like RFID, the UWB kit is not read over generic serial text: it's the same
 Qorvo DWM3001CDK boards as `UWB_lab`, running FiRa two-way ranging (TWR)
 between one fixed **anchor** (FiRa "controller" role) and one or more worn
 **nodes** (FiRa "controlee" role) — this project's kit is 1 anchor + 2 nodes
@@ -150,7 +172,7 @@ python collect_gesture_dataset.py \
   --uwb-anchor-port /dev/cu.usbmodemCCCC \
   --uwb-node-port /dev/cu.usbmodemDDDD --uwb-node-port /dev/cu.usbmodemEEEE \
   --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \
-  --rfid-port /dev/cu.usbserial-FFFF \
+  --rfid \
   --gesture pull,push,clockwise,anti_clockwise \
   --trials 5 \
   --duration 4
@@ -223,10 +245,12 @@ per-sensor-combination counts in the combined `dataset_metadata.json`.
 
 `features.py` extracts a fixed-length feature vector per sensor from each
 trial's `.npz` (mmWave: energy/point-count/velocity summary stats over the
-trial window; UWB: the same baseline range-shape stats as `UWB_lab`; IMU/RFID:
-best-effort parsing of the recommended JSON-line schema into per-axis / RSSI
-summary stats). These are starting points, not the final word on features --
-replace them once you understand what actually separates your gestures.
+trial window; UWB: the same baseline range-shape stats as `UWB_lab`; IMU:
+parses `IMU_lab_students`' `accel[g].../gyro[dps]...` log lines into per-axis
+summary stats; RFID: parses `RFID_Lab`'s `<EPC> <timestamp> <RSSI>
+<read_count>` report lines into RSSI/tag-count summary stats). These are
+starting points, not the final word on features -- replace them once you
+understand what actually separates your gestures.
 
 ### Single-sensor baseline vs. fused model
 
@@ -291,9 +315,13 @@ and are saved to `sessions/eval_<name>/realtime_predictions.csv`.
 
 - If the radar won't configure after a previous run, power-cycle the EVM and
   rerun — same as `mmwave_lab`.
-- If a JSON/IMU/RFID port produces zero lines, double check the baud rate
-  (`--imu-baud` / `--rfid-baud`, default 115200) and that the firmware is
-  actually printing to USB serial (not just a debug UART).
+- If IMU produces zero lines, double check `--imu-baud` (default 115200) and
+  that the firmware is actually printing to USB serial (not just a debug
+  UART).
+- If RFID produces zero lines, confirm your laptop is connected to the
+  reader's network and reachable at `--rfid-host`:`--rfid-tcp-port` (default
+  `192.168.137.1:9055`) -- it's a TCP device, not a serial port, so a wrong
+  port number here means "wrong network," not "wrong `/dev/...` path."
 - If UWB produces zero Ok samples: confirm all boards are on the
   class-sheet-assigned preamble code/channel, that no other terminal/process
   already has any port open, and check
@@ -315,7 +343,8 @@ and are saved to `sessions/eval_<name>/realtime_predictions.csv`.
 - `gestures.py`: canonical gesture registry (names, instructions, suggested sensors).
 - `collect_gesture_dataset.py`: main multi-sensor trial-based collector.
 - `combine_gesture_datasets.py`: merge datasets from multiple collectors.
-- `sensors/serial_json_stream.py`: generic background-thread raw-line reader for IMU/RFID.
+- `sensors/serial_json_stream.py`: background-thread raw-line reader for IMU (USB serial).
+- `sensors/rfid_tcp_stream.py`: background-thread raw-line reader for the RFID reader (TCP socket, not serial).
 - `sensors/common.py`: shared timestamp/manifest/JSON helpers.
 - `mmwave/radar_io.py`: TI xWRL6432 UART protocol (adapted from `mmwave_lab`).
 - `mmwave/mmwave_stream.py`: background-thread radar frame reader with time-windowed extraction.

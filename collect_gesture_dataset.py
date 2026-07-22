@@ -8,9 +8,12 @@ run several sensors concurrently on independent background threads:
 
     - mmWave radar (TI xWRL6432): binary UART frames, decoded with
       `mmwave/radar_io.py` (adapted from mmwave_lab).
-    - IMU (ESP32 Core2), RFID reader: newline-delimited serial text, read raw
-      by `sensors/serial_json_stream.py` (see that file for the
-      expected/recommended JSON-line firmware contract).
+    - IMU (ESP32 Core2 + BMI270, `IMU_lab_students` firmware): newline-
+      delimited serial text (`accel[g]... | gyro[dps]...`), read raw by
+      `sensors/serial_json_stream.py` and parsed by `features.py`.
+    - RFID (`RFID_Lab` reader): newline-delimited text over a **TCP socket**
+      (not serial -- the reader is a network device), read raw by
+      `sensors/rfid_tcp_stream.py` and parsed by `features.py`.
     - UWB: a Qorvo DWM3001CDK anchor + one-or-more-nodes FiRa ranging setup
       (this project's kit: 1 fixed anchor + 2 worn nodes), driven by
       `uwb/uwb_stream.py` (adapted from `UWB_lab`). This needs an anchor
@@ -38,7 +41,7 @@ Example (all four sensors):
         --uwb-anchor-port /dev/cu.usbmodemZZZZ \\
         --uwb-node-port /dev/cu.usbmodemWWWW --uwb-node-port /dev/cu.usbmodemVVVV \\
         --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
-        --rfid-port /dev/cu.usbserial-WWWW \\
+        --rfid \\
         --gesture pull,push,clockwise,anti_clockwise \\
         --trials 5 --duration 4
 
@@ -59,6 +62,7 @@ import numpy as np
 from gestures import GESTURES, normalize_gestures
 from mmwave.mmwave_stream import MmwaveStream
 from sensors.common import append_manifest, now_text, safe_label, timestamp, write_json
+from sensors.rfid_tcp_stream import RfidTcpStream
 from sensors.serial_json_stream import SerialLineStream
 from uwb.uwb_stream import UwbStream
 
@@ -180,9 +184,12 @@ def parse_args() -> argparse.Namespace:
         help="Skip the UCI device reset before/after ranging (use if it's already known-good).",
     )
 
-    rfid_group = parser.add_argument_group("RFID")
-    rfid_group.add_argument("--rfid-port", help="RFID reader serial port.")
-    rfid_group.add_argument("--rfid-baud", type=int, default=115200)
+    rfid_group = parser.add_argument_group("RFID (RFID_Lab reader, TCP -- not serial)")
+    rfid_group.add_argument("--rfid", action="store_true", help="Enable the RFID reader.")
+    rfid_group.add_argument(
+        "--rfid-host", default="192.168.137.1", help="RFID reader network address (see RFID_Lab)."
+    )
+    rfid_group.add_argument("--rfid-tcp-port", type=int, default=9055, help="RFID reader TCP port.")
 
     return parser.parse_args()
 
@@ -215,7 +222,7 @@ class SensorSet:
         self.mmwave: MmwaveStream | None = None
         self.imu: SerialLineStream | None = None
         self.uwb: UwbStream | None = None
-        self.rfid: SerialLineStream | None = None
+        self.rfid: RfidTcpStream | None = None
 
         if bool(args.uwb_anchor_port) != bool(args.uwb_node_port):
             raise SystemExit(
@@ -256,9 +263,9 @@ class SensorSet:
                     slots_per_rr=args.uwb_slots_per_rr,
                     reset_devices_first=not args.uwb_skip_device_reset,
                 )
-            if args.rfid_port:
-                print(f"Opening RFID on {args.rfid_port}...")
-                self.rfid = SerialLineStream("rfid", args.rfid_port, args.rfid_baud)
+            if args.rfid:
+                print(f"Opening RFID reader at {args.rfid_host}:{args.rfid_tcp_port}...")
+                self.rfid = RfidTcpStream(args.rfid_host, args.rfid_tcp_port)
         except Exception:
             self.close()
             raise
@@ -267,7 +274,7 @@ class SensorSet:
             self.close()
             raise SystemExit(
                 "No sensors enabled. Pass at least one of --mmwave-port, --imu-port, "
-                "--uwb-anchor-port/--uwb-node-port, --rfid-port."
+                "--uwb-anchor-port/--uwb-node-port, --rfid."
             )
 
         # Let boards settle and start producing data before the first trial.
@@ -470,7 +477,7 @@ def make_dataset_metadata(args: argparse.Namespace, gesture_list: list[str], sen
             "imu": args.imu_port,
             "uwb_anchor": args.uwb_anchor_port,
             "uwb_nodes": args.uwb_node_port,
-            "rfid": args.rfid_port,
+            "rfid": f"{args.rfid_host}:{args.rfid_tcp_port}" if args.rfid else None,
         },
         "uwb_config": (
             {

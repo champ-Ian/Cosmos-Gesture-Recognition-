@@ -36,6 +36,7 @@ import numpy as np
 from features import extract_sensor_features
 from mmwave.mmwave_stream import MmwaveStream
 from sensors.common import timestamp
+from sensors.rfid_tcp_stream import RfidTcpStream
 from sensors.serial_json_stream import SerialLineStream
 from uwb.uwb_stream import UwbStream
 
@@ -78,9 +79,9 @@ def parse_args() -> argparse.Namespace:
     uwb_group.add_argument("--uwb-slots-per-rr", type=int, default=None)
     uwb_group.add_argument("--uwb-skip-device-reset", action="store_true")
 
-    rfid_group = parser.add_argument_group("RFID")
-    rfid_group.add_argument("--rfid-port")
-    rfid_group.add_argument("--rfid-baud", type=int, default=115200)
+    rfid_group = parser.add_argument_group("RFID (RFID_Lab reader, TCP -- not serial)")
+    rfid_group.add_argument("--rfid-host", default="192.168.137.1")
+    rfid_group.add_argument("--rfid-tcp-port", type=int, default=9055)
 
     return parser.parse_args()
 
@@ -133,10 +134,8 @@ def open_streams(args: argparse.Namespace, required_sensors: list[str], session_
                 reset_devices_first=not args.uwb_skip_device_reset,
             )
         if "rfid" in required_sensors:
-            if not args.rfid_port:
-                raise SystemExit("This model needs RFID -- pass --rfid-port.")
-            print(f"Opening RFID on {args.rfid_port}...")
-            streams["rfid"] = SerialLineStream("rfid", args.rfid_port, args.rfid_baud)
+            print(f"Opening RFID reader at {args.rfid_host}:{args.rfid_tcp_port}...")
+            streams["rfid"] = RfidTcpStream(args.rfid_host, args.rfid_tcp_port)
     except Exception:
         close_streams(streams)
         raise

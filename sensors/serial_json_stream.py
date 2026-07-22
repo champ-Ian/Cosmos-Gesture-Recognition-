@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-Generic background-thread reader for the ESP32-based IoT sensors (IMU, UWB,
-RFID) shipped in the COSMOS project box.
+Generic background-thread reader for the ESP32-based IMU board (`IMU_lab_students`)
+shipped in the COSMOS project box.
 
-Unlike the mmWave radar, these boards do not have a single documented binary
-protocol here, and each group's firmware may still change field names or
-sample rate while the project is being built. Rather than guessing a schema
-and silently dropping anything that does not match it, this reader stores the
-**raw newline-delimited text** each board prints over USB serial, tagged with
-a `time.monotonic()` receive timestamp. That raw log is never lossy: whatever
-the firmware prints is exactly what ends up in the trial `.npz` file, and
-feature extraction (parsing JSON, picking out fields) can be written or fixed
-later without recollecting data.
+UWB and RFID are NOT read this way -- UWB is driven by `uwb/uwb_stream.py`
+(subprocess-based FiRa ranging, not raw serial text) and RFID is a network
+device read by `sensors/rfid_tcp_stream.py` (TCP socket, not serial).
 
-Expected firmware contract (recommended, not enforced):
-    One JSON object per line, newline-terminated, e.g.:
-        IMU  : {"t_ms": 12345, "ax": 0.01, "ay": 0.98, "az": 0.03,
-                 "gx": 1.2, "gy": -0.3, "gz": 0.1}
-        UWB  : {"t_ms": 12345, "ranges_m": {"anchor_0": 1.23, "anchor_1": 0.87}}
-        RFID : {"t_ms": 12345, "tag_id": "E200...", "rssi": -41.5}
-If your firmware prints plain CSV or something else, that is fine too -- the
-raw line is stored either way. Update `sensors/parsing.py` (or write your own)
-to match whatever your boards actually send.
+This reader stores the **raw newline-delimited text** the IMU board prints
+over USB serial, tagged with a `time.monotonic()` receive timestamp, rather
+than parsing at capture time. That raw log is never lossy: whatever the
+firmware prints is exactly what ends up in the trial `.npz` file, and feature
+extraction (`features.py`) can be fixed later without recollecting data.
+
+Firmware contract (`IMU_lab_students/main/main.c`): one line per sample,
+newline-terminated, e.g.:
+    accel[g] x= 0.012 y=-0.034 z= 0.998 | gyro[dps] x= 0.10 y=-0.20 z= 0.05
+If your group's firmware prints something else, the raw line is still stored
+either way -- update the parser in `features.py` (`_IMU_SAMPLE_RE`) to match
+whatever your board actually sends.
 """
 from __future__ import annotations
 
