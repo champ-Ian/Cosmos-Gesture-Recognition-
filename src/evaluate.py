@@ -13,14 +13,14 @@ Uses the model's own `sensors`/`fusion` config (stored in the `.joblib`
 payload) to know which sensors to extract features for and how to combine
 them -- you don't need to re-specify `--sensors`/`--fusion`.
 
-Usage:
+Run from the repo root as `python src/evaluate.py ...`:
 
-    python evaluate.py --model models/knn_early_mmwave-imu_....joblib \\
-        data/processed/combined
+    python src/evaluate.py data/processed/combined \\
+        --model models/knn_early_mmwave-imu_....joblib
 
     # Held-out-person check: only evaluate one collector's trials
-    python evaluate.py --model models/knn_early_mmwave-imu_....joblib \\
-        data/processed/combined --test-collector student04
+    python src/evaluate.py data/processed/combined \\
+        --model models/knn_early_mmwave-imu_....joblib --test-collector student04
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+from sensors.common import RESULTS_FIGURES_DIR
 from train import build_examples, normalize_filter, read_manifests
 
 
@@ -42,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="Only evaluate trials from this collector (e.g. a held-out person). Default: evaluate on all trials.",
     )
-    parser.add_argument("--confusion-out", help="Output confusion matrix PNG. Default: next to --model.")
+    parser.add_argument("--confusion-out", help="Output confusion matrix PNG. Default: <repo>/results/figures/.")
     parser.add_argument("--summary-out", help="Output summary JSON. Default: next to --model.")
     return parser.parse_args()
 
@@ -110,9 +111,12 @@ def main() -> int:
         for i, label in enumerate(labels_order)
     }
 
-    confusion_out = Path(args.confusion_out) if args.confusion_out else model_path.with_name(
-        model_path.stem + "_eval_confusion_matrix.png"
+    confusion_out = (
+        Path(args.confusion_out)
+        if args.confusion_out
+        else RESULTS_FIGURES_DIR / (model_path.stem + "_eval_confusion_matrix.png")
     )
+    confusion_out.parent.mkdir(parents=True, exist_ok=True)
     display = ConfusionMatrixDisplay(confusion_matrix=matrix, display_labels=labels_order)
     fig, ax = plt.subplots(figsize=(6, 5))
     display.plot(ax=ax, cmap="Blues", colorbar=False, xticks_rotation=45)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared classifier building blocks for `train.py` / `eval_realtime.py`.
+Shared classifier building blocks for `train.py` / `evaluate.py` / `realtime_demo.py`.
 
 `build_classifier` mirrors `UWB_lab/train.py`'s starter KNN/linear-SVM
 choices so the two classifiers you're asked to compare (per the final

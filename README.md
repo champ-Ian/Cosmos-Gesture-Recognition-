@@ -4,14 +4,64 @@ Cumulative IoT and Data Science final project at COSMOS UCLA. Recognize gestures
 from the course's [gesture list](#gesture-list) using a fused multi-sensor IoT
 pipeline: mmWave radar, IMU, UWB ranging, and RFID.
 
-This repo contains both the **data collection framework** and the
-**training/evaluation pipeline** (single-sensor baseline vs. fused model,
-confusion matrix, held-out-person evaluation, live evaluation) -- see
-[Training and evaluation](#training-and-evaluation) below. The feature
-extractors are deliberately simple starter/baseline features (mirroring how
-`UWB_lab` ships baseline range features and leaves a `_proposal` extractor as
-a student TODO) -- expect to replace or extend them once you've looked at
-your own recorded data.
+This repo contains the full pipeline: data collection, dataset cutting,
+training/evaluation (single-sensor baseline vs. fused model, confusion
+matrix, held-out-person evaluation), and live evaluation. The architecture
+follows the final-project implementation hints (Shanmu Wang): sensors
+stream continuously, a coordinator writes event markers, and cutting into
+per-trial windows happens offline -- see
+[Collecting data](#collecting-data) below. The feature extractors are
+deliberately simple starter/baseline features (mirroring how `UWB_lab` ships
+baseline range features and leaves a `_proposal` extractor as a student
+TODO) -- expect to replace or extend them once you've looked at your own
+recorded data.
+
+## Project layout
+
+Follows the final-project implementation-hints skeleton (Shanmu Wang):
+scripts and importable code live under `src/`; runtime data/models/figures
+live at the repo root, outside `src/`, and are gitignored.
+
+```text
+README.md
+requirements.txt
+src/
+  collect.py               # coordinator: streams all sensors, logs events + continuous per-sensor logs
+  extract_features.py      # cuts a raw session into per-trial data, and extracts features from it
+  combine_datasets.py      # merge processed datasets from multiple collectors
+  train.py                 # train a single-sensor or fused gesture classifier
+  evaluate.py               # evaluate an already-trained model against a dataset (no retraining)
+  realtime_demo.py          # live sliding-window gesture evaluation using a trained model
+  gestures.py               # canonical gesture registry
+  gesture_models.py         # shared classifier builder + LateFusionClassifier
+  sensors/
+    base_reader.py          # shared reader interface (check_error/sample_count/window/close)
+    imu_reader.py            # IMU (USB serial)
+    uwb_reader.py             # UWB (Qorvo FiRa TWR, subprocess-driven)
+    mmwave_reader.py           # mmWave radar (USB serial, binary protocol)
+    rfid_reader.py              # RFID (TCP socket, not serial)
+    common.py                    # shared timestamp/manifest/JSON helpers + REPO_DIR/output-path constants
+  mmwave/radar_io.py         # TI xWRL6432 UART protocol (adapted from mmwave_lab)
+  mmwave/xwrL64xx-evm/*.cfg  # radar configs
+  uwb/uwb_io.py              # Qorvo FiRa TWR subprocess helpers + ranging log parser
+  uwb/uwb-qorvo-tools/       # vendored Qorvo UCI/FiRa CLI
+data/
+  raw/                     # collect.py output: one folder per session
+  processed/               # extract_features.py cut output: per-trial datasets
+models/                    # trained .joblib models
+results/
+  figures/                 # confusion-matrix PNGs
+```
+
+There's no `src/sensors/wifi_reader.py` / WiFi CSI support here -- it's in the
+general class kit but wasn't part of this project's sensor box.
+
+**Run every script from the repo root** as `python src/<script>.py ...`
+(e.g. `python src/collect.py --collector student01 ...`) -- that's what all
+the examples below assume. All path defaults (`data/raw`, `data/processed`,
+`models/`, `results/figures/`, the mmWave `.cfg`) are resolved relative to
+the repo root regardless of your current directory, so this also works if
+you `cd src/` first and drop the `src/` prefix instead.
 
 ## Sensing plan
 
@@ -36,8 +86,24 @@ collection). Per the project requirements, you should collect at least one
 
 These are the canonical (snake_case) names used everywhere in code — see
 `gestures.py` for the full registry (display name, spoken instruction,
-suggested sensors). Start with a smaller subset (`--gesture pull,push,left,right`)
-before collecting all 15.
+suggested sensors, and **group**). Start with a smaller subset
+(`--gesture pull,push,left,right`) before collecting all 15.
+
+Each gesture also has a `group` (per the final-project implementation
+hints):
+
+- **discrete** (`pull`, `push`, `clockwise`, `anti_clockwise`, `right`,
+  `left`, `bye_bye`, `t_arm`, `raise_arms`, `fist_open`): one clean instance
+  per trial, clear start/end. `collect.py` prompts trial-by-trial.
+- **periodic** (`clapping`, `one_arm_boxing`, `two_arm_boxing`,
+  `palm_up_down`, `soli`): repeated cycles with no single natural boundary.
+  `collect.py` records one long continuous take instead; segmenting that
+  into individual cycles happens later, in `extract_features.py cut`.
+
+`fist_open` is graded as discrete here, not periodic -- reasonable people
+could call it either way (repeated open/close cycles), and the
+implementation-hints slide didn't explicitly list it. Edit `gestures.py`'s
+`GestureSpec(..., group=...)` if you'd rather treat it as periodic.
 
 ## Setup
 
@@ -55,7 +121,7 @@ adapter) — see that repo's `README.md` Section 0 for the pinout and
 (`ls /dev/cu.usbserial*` / `python -m serial.tools.list_ports -v` on macOS,
 Device Manager on Windows).
 
-The default radar config (`mmwave/xwrL64xx-evm/near_field_hand_50cm.cfg`,
+The default radar config (`src/mmwave/xwrL64xx-evm/near_field_hand_50cm.cfg`,
 copied from `mmwave_lab`) streams both a range profile and a point cloud in
 the first 50 cm — good for hand/arm gestures directly in front of the board.
 Use `--mmwave-cfg` to point at a different `.cfg` (e.g. `point_cloud.cfg` for
@@ -64,9 +130,10 @@ a wider field of view) if a gesture needs more range.
 ### IMU wiring (ESP32 + BMI270, `IMU_lab_students` firmware)
 
 The IMU board is a USB serial device (`--imu-port`, default baud 115200).
-The collector reads **newline-terminated raw text lines** and timestamps
-them on arrival (see `sensors/serial_json_stream.py`); nothing is parsed at
-collection time, so firmware changes don't force a recollect.
+`collect.py` reads **newline-terminated raw text lines** and timestamps
+them on arrival (see `src/sensors/imu_reader.py`); nothing is parsed at
+collection time (the raw line is kept alongside the parsed columns in the
+continuous log), so firmware changes don't force a recollect.
 
 The actual firmware (`IMU_lab_students/main/main.c`) prints one line per
 sample, not JSON:
@@ -75,11 +142,12 @@ sample, not JSON:
 accel[g] x= 0.012 y=-0.034 z= 0.998 | gyro[dps] x= 0.10 y=-0.20 z= 0.05
 ```
 
-`features.py`'s `extract_imu_features()` parses exactly this format. If your
-group's firmware prints something else, update the `_IMU_SAMPLE_RE` regex at
-the top of `features.py`'s IMU section to match -- the raw line is always
-stored either way, so this only means re-running feature extraction, not
-recollecting data.
+`extract_features.py` parses exactly this format (`parse_imu_line()`/
+`_IMU_SAMPLE_RE`), and `collect.py` uses the same parser to fill in the
+`ax..gz` columns of the live `imu.csv` log. If your group's firmware prints
+something else, update `_IMU_SAMPLE_RE` -- the raw line is always stored
+either way, so this only means re-running the cut/feature-extraction step,
+not recollecting data.
 
 ### RFID wiring (`RFID_Lab` reader, TCP -- not serial)
 
@@ -87,7 +155,7 @@ Unlike every other sensor here, the RFID reader is **not a USB serial
 device** -- it's a network device that streams tag reads over a **TCP
 socket**, same as `RFID_Lab/reading_from_TCP.py` / `touch_detector_gui.py`.
 Connect your laptop to the reader's network (its default address is
-`192.168.137.1:9055`) before collecting; `sensors/rfid_tcp_stream.py` opens
+`192.168.137.1:9055`) before collecting; `src/sensors/rfid_reader.py` opens
 that socket instead of a serial port. Enable it with `--rfid` (override the
 address with `--rfid-host`/`--rfid-tcp-port` if needed).
 
@@ -99,10 +167,11 @@ E2806995000040154D38514E 2024-01-01 12:00:00.123 -45 3
 ```
 
 `<EPC> <timestamp> <RSSI> <read_count>`, space-separated (see
-`RFID_Lab/rfid_log_utils.py`). `features.py`'s `extract_rfid_features()`
-pools every tag read in the trial window into one feature vector by
-default; if your gestures use specific tags (e.g. Soli-style one-tag-per-
-finger sensing), filter by EPC first for per-tag features instead.
+`RFID_Lab/rfid_log_utils.py`). `extract_features.py`'s
+`extract_rfid_features()` pools every tag read in the trial window into one
+feature vector by default; if your gestures use specific tags (e.g.
+Soli-style one-tag-per-finger sensing), filter by EPC first for per-tag
+features instead.
 
 ### UWB wiring (Qorvo DWM3001CDK FiRa ranging: anchor + node(s))
 
@@ -115,12 +184,13 @@ distance-from-anchor signals instead of one. Each board needs its own serial
 port (`ls /dev/cu.usbmodem*` on macOS), and every board in the setup must use
 the same class-sheet-assigned preamble code and channel.
 
-`uwb/uwb_stream.py` drives this the same way `UWB_lab/ranging_experiment_wrapper.py`
-does: it launches the vendored `uwb/uwb-qorvo-tools/scripts/fira/run_fira_twr/run_fira_twr.py`
-as a subprocess per board (resetting all devices first via UCI), then parses
-the anchor's `distance: X cm` / `status: Ok (0x0)` / `mac address: ...` stdout
-lines with a regex-based log parser. Only the anchor reports distance; nodes
-just need to be running so the anchor has something to range against.
+`src/sensors/uwb_reader.py` drives this the same way
+`UWB_lab/ranging_experiment_wrapper.py` does: it launches the vendored
+`src/uwb/uwb-qorvo-tools/scripts/fira/run_fira_twr/run_fira_twr.py` as a
+subprocess per board (resetting all devices first via UCI), then parses the
+anchor's `distance: X cm` / `status: Ok (0x0)` / `mac address: ...` stdout
+lines with a regex-based log parser. Only the anchor reports distance;
+nodes just need to be running so the anchor has something to range against.
 
 Required flags when UWB is enabled:
 
@@ -144,28 +214,36 @@ defaults to 6, same as that lab.
 "one-to-many" mode (`uwb-qorvo-tools`'s own
 `--node`/`--n_controlees`/`--mac`/`--dest-mac` flags), with each node
 assigned a distinct MAC address and every sample tagged with which node's
-MAC it came from (`uwb_mac_address` in the saved `.npz`, see below).
+MAC it came from (`uwb_mac_address` in the cut trial `.npz`, see below).
 **This path is not exercised by `UWB_lab`'s documented lab and has not been
 verified against physical DWM3001CDK hardware** — `--uwb-slots-per-rr`
 defaults to a heuristic (`6 * node count`) that may need tuning. Before
 trusting it for real data collection, run a short (`--trials 1 --duration 3`)
-smoke test and check `datasets/<name>/uwb_logs/anchor/anchor_terminal_log.txt`
+smoke test and check `data/raw/<session>/uwb_logs/anchor/anchor_terminal_log.txt`
 for `status: Ok` against every node's MAC — if ranging is unstable or a node
 never shows `Ok`, try increasing `--uwb-slots-per-rr` first.
 
 Per-board logs and device-reset logs are written under
-`datasets/<dataset_name>/uwb_logs/`.
+`data/raw/<session>/uwb_logs/`.
 
 ## Collecting data
 
-Only pass `--*-port` for sensors you actually have wired up right now — any
-sensor without a port is skipped, which is how you'd collect a single-sensor
-baseline.
+Only pass `--*-port` (and `--rfid`) for sensors you actually have wired up
+right now — any sensor without a port is skipped, which is how you'd collect
+a single-sensor baseline.
 
-Full four-sensor collection:
+`collect.py` is a **coordinator**: every enabled sensor streams
+continuously for the whole session on its own background thread; `collect.py`
+owns the clock (`time.monotonic()` from session start) and writes event
+markers (`session_start`/`trial_start`/`trial_end`/`trial_accept`/
+`trial_reject`) plus each sensor's continuously-growing log. **Nothing is cut
+into per-trial windows at collection time** -- that happens afterward, in
+`extract_features.py cut` (see below).
+
+Full four-sensor collection (discrete + periodic gestures in one session):
 
 ```bash
-python collect_gesture_dataset.py \
+python src/collect.py \
   --collector student01 \
   --mmwave-port /dev/cu.usbserial-AAAA \
   --imu-port /dev/cu.usbserial-BBBB \
@@ -173,15 +251,14 @@ python collect_gesture_dataset.py \
   --uwb-node-port /dev/cu.usbmodemDDDD --uwb-node-port /dev/cu.usbmodemEEEE \
   --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \
   --rfid \
-  --gesture pull,push,clockwise,anti_clockwise \
-  --trials 5 \
-  --duration 4
+  --gesture pull,push,clapping \
+  --trials 5 --duration 4 --periodic-duration 20
 ```
 
 Single-sensor baseline (mmWave only):
 
 ```bash
-python collect_gesture_dataset.py \
+python src/collect.py \
   --collector student01 \
   --mmwave-port /dev/cu.usbserial-AAAA \
   --trials 5 --duration 4
@@ -190,31 +267,63 @@ python collect_gesture_dataset.py \
 Short smoke test (1 trial, 2 gestures, short window) before a full session:
 
 ```bash
-python collect_gesture_dataset.py \
+python src/collect.py \
   --collector student01 --mmwave-port /dev/cu.usbserial-AAAA \
   --gesture pull,push --trials 1 --duration 2
 ```
 
-For each trial the script prompts with the gesture name, instructions, and
-suggested sensors, waits for Enter, records for `--duration` seconds while
-printing live per-sensor sample counts, then asks whether to keep the
-recording (`--auto-accept` skips that prompt for unattended runs).
+For each trial the script prompts with the gesture name, instructions,
+group (`[discrete]`/`[periodic]`), and suggested sensors, waits for Enter,
+records for `--duration` seconds (or `--periodic-duration` for periodic
+gestures) while printing live per-sensor sample counts, then asks whether
+to keep the recording (`--auto-accept` skips that prompt for unattended
+runs).
 
 Output layout:
 
 ```text
-datasets/gesture_dataset_YYYYMMDD_HHMMSS/
-  dataset_metadata.json
-  trials.csv
-  uwb_logs/                 # only if UWB was enabled: device-reset + anchor/node logs
-  sessions/
-    gesture_student01_pull_001/
-      trial_data.npz
-      trial_metadata.json
-    ...
+data/raw/session_<dataset-name>/
+  session_metadata.json
+  events.csv                  # time_s,event,trial_id,gesture,collector
+  trials.csv                  # accepted trials only
+  imu.csv                     # time_s,sensor,ax,ay,az,gx,gy,gz,raw_line
+  uwb.csv                     # time_s,sensor,sequence,mac_address,status,distance_cm
+  rfid.csv                    # time_s,sensor,epc,rssi,read_count,raw_line
+  mmwave.npz                  # whole-session frame/point-cloud arrays
+  uwb_logs/                   # only if UWB was enabled: device-reset + anchor/node logs
 ```
 
-Each `trial_data.npz` holds, per enabled sensor:
+Only the sensors you enabled get a log file. `events.csv`/`imu.csv`/
+`uwb.csv`/`rfid.csv` all use `time_s` relative to the same session-start
+clock, so any tool can slice all of them consistently without needing
+hardware-level sync between boards. mmWave doesn't flatten into CSV rows
+the way the scalar sensors do (a range profile / point cloud is inherently
+array-shaped per frame), so it's saved as one combined `.npz` for the whole
+session instead.
+
+### Cutting a session into per-trial data
+
+```bash
+python src/extract_features.py cut data/raw/session_student01_.../ \
+  --output data/processed/student01_session1
+```
+
+Reads `events.csv` for each accepted trial's `[trial_start, trial_end]`
+window, slices every enabled sensor's continuous log to that window, and
+writes one `trial_data.npz` per trial plus a `trials.csv` manifest —
+matching the same per-trial-npz shape `train.py`/`evaluate.py`/
+`combine_datasets.py` consume.
+
+**Periodic gestures are segmented here**, not during collection: a long
+continuous take gets sliced into fixed-length sub-windows
+(`--segment-length`, default 3.0s; `--segment-stride`, default =
+`--segment-length`, i.e. non-overlapping), each becoming its own trial row
+sharing the same gesture label (`<trial_id>_seg000`, `_seg001`, ...).
+Discrete trials pass through unsegmented (their own recorded start/end).
+Tune `--segment-length` once you've looked at how long one clap/punch/cycle
+actually takes in your recordings.
+
+Each cut `trial_data.npz` holds, per enabled sensor:
 - mmWave: `mmwave_frame_number`, `mmwave_time_s`, `mmwave_range_profile`,
   `mmwave_point_count`, `mmwave_points_xyz`, `mmwave_points_velocity`.
 - IMU/RFID: `{sensor}_recv_time_s` and `{sensor}_raw_lines` (raw text, one
@@ -227,14 +336,14 @@ Each `trial_data.npz` holds, per enabled sensor:
 ### Combining datasets from multiple group members
 
 Per the project requirements ("data from multiple group members when
-possible" and evaluating a held-out person), combine each collector's dataset
-before training:
+possible" and evaluating a held-out person), cut each collector's raw
+session first, then combine the processed datasets:
 
 ```bash
-python combine_gesture_datasets.py \
-  datasets/gesture_dataset_student01_... \
-  datasets/gesture_dataset_student02_... \
-  --output datasets/combined_gesture_dataset
+python src/combine_datasets.py \
+  data/processed/student01_session1 \
+  data/processed/student02_session1 \
+  --output data/processed/combined
 ```
 
 This concatenates manifests into one `trials.csv` (rewriting session/npz
@@ -243,14 +352,14 @@ per-sensor-combination counts in the combined `dataset_metadata.json`.
 
 ## Training and evaluation
 
-`features.py` extracts a fixed-length feature vector per sensor from each
-trial's `.npz` (mmWave: energy/point-count/velocity summary stats over the
-trial window; UWB: the same baseline range-shape stats as `UWB_lab`; IMU:
-parses `IMU_lab_students`' `accel[g].../gyro[dps]...` log lines into per-axis
-summary stats; RFID: parses `RFID_Lab`'s `<EPC> <timestamp> <RSSI>
-<read_count>` report lines into RSSI/tag-count summary stats). These are
-starting points, not the final word on features -- replace them once you
-understand what actually separates your gestures.
+`extract_features.py` also extracts a fixed-length feature vector per
+sensor from each cut trial's `.npz` (mmWave: energy/point-count/velocity
+summary stats over the trial window; UWB: the same baseline range-shape
+stats as `UWB_lab`; IMU: parses `IMU_lab_students`' `accel[g].../gyro[dps]...`
+log lines into per-axis summary stats; RFID: parses `RFID_Lab`'s `<EPC>
+<timestamp> <RSSI> <read_count>` report lines into RSSI/tag-count summary
+stats). These are starting points, not the final word on features --
+replace them once you understand what actually separates your gestures.
 
 ### Single-sensor baseline vs. fused model
 
@@ -260,10 +369,10 @@ gives you a fused model to compare against it:
 
 ```bash
 # Single-sensor baseline (mmWave only)
-python train.py datasets/combined_gesture_dataset --sensors mmwave
+python src/train.py data/processed/combined --sensors mmwave
 
 # Fused model (mmWave + IMU)
-python train.py datasets/combined_gesture_dataset --sensors mmwave,imu
+python src/train.py data/processed/combined --sensors mmwave,imu
 ```
 
 `--fusion early` (default) concatenates every selected sensor's features into
@@ -273,35 +382,53 @@ prediction time (see the project spec's Fusion type table) -- run both to
 compare:
 
 ```bash
-python train.py datasets/combined_gesture_dataset --sensors mmwave,imu --fusion late
+python src/train.py data/processed/combined --sensors mmwave,imu --fusion late
 ```
 
 Compare classifiers with `--classifier knn` (default) or `--classifier
 svm_linear`, same starter choices as `UWB_lab`. Each run writes a
-`.joblib` model, a confusion-matrix PNG, and a `_summary.json` (accuracy,
-per-class recall, classification report, which trials were skipped and why)
-next to the dataset (or under `models/` if you passed multiple dataset
-folders).
+`.joblib` model + `_summary.json` (accuracy, per-class recall,
+classification report, which trials were skipped and why) to `models/`,
+and a confusion-matrix PNG to `results/figures/` -- override with
+`--model-out`/`--confusion-out`. A simple neural network (e.g. a 1D CNN
+over the raw per-sensor time series) is a good next step once KNN/SVM are
+working and you want better performance -- not built here yet.
 
 ### Held-out-person evaluation
 
 ```bash
-python train.py datasets/combined_gesture_dataset --sensors mmwave,imu --test-collector student03
+python src/train.py data/processed/combined --sensors mmwave,imu --test-collector student03
 ```
 
 Trains on every collector except `student03` and tests only on their trials
 -- compare this accuracy against a random train/test split to see whether
 the model generalizes to a person it never saw.
 
+### Evaluating an already-trained model
+
+`evaluate.py` loads a saved model and reports metrics against a dataset
+**without retraining** -- use it to check a model against data collected
+after training (a genuinely new held-out person/session), or to regenerate
+a confusion matrix without rerunning `train.py`:
+
+```bash
+python src/evaluate.py data/processed/student04_session1 \
+  --model models/knn_early_mmwave-imu_20260101_120000.joblib
+```
+
+It reads the model's own `sensors`/`fusion` config, so you don't need to
+re-specify them. `--test-collector` filters to one collector's trials, same
+as `train.py`.
+
 ### Live evaluation
 
-`eval_realtime.py` loads a trained model, opens only the sensor streams it
+`realtime_demo.py` loads a trained model, opens only the sensor streams it
 actually needs (from the model's own metadata), and predicts on a sliding
 window every `--step-seconds`:
 
 ```bash
-python eval_realtime.py \
-  --model datasets/combined_gesture_dataset/models/knn_early_mmwave-imu_20260101_120000.joblib \
+python src/realtime_demo.py \
+  --model models/knn_early_mmwave-imu_20260101_120000.joblib \
   --mmwave-port /dev/cu.usbserial-XXXX \
   --imu-port /dev/cu.usbserial-YYYY \
   --duration 60 --window-seconds 3 --step-seconds 0.5 --vote-window 5
@@ -325,37 +452,26 @@ and are saved to `sessions/eval_<name>/realtime_predictions.csv`.
 - If UWB produces zero Ok samples: confirm all boards are on the
   class-sheet-assigned preamble code/channel, that no other terminal/process
   already has any port open, and check
-  `datasets/<dataset_name>/uwb_logs/anchor/anchor_terminal_log.txt` for the
+  `data/raw/<session>/uwb_logs/anchor/anchor_terminal_log.txt` for the
   raw `run_fira_twr.py` output. Use `--uwb-skip-device-reset` only if the
   boards are already known-good — a bad reset is a common cause of a silent
   anchor. With multiple nodes, if only some nodes' MACs ever show
   `status: Ok`, try raising `--uwb-slots-per-rr` first (see the UWB wiring
   section above).
-- `Ctrl+C` stops the collector cleanly; it sends `sensorStop 0` to the radar,
-  resets the UWB boards, and closes all serial ports/subprocesses before
-  exiting.
+- `Ctrl+C` stops the collector cleanly during a trial recording; it sends
+  `sensorStop 0` to the radar, resets the UWB boards, and closes all serial
+  ports/subprocesses before exiting. Whatever was already logged up to that
+  point in `events.csv`/the per-sensor CSVs is preserved (the session is
+  still cuttable), but the interrupted trial itself has no `trial_accept`
+  event and won't show up in `trials.csv`.
 - Use `--min-mmwave-frames` / `--min-sensor-lines` to tune how aggressively
-  short/glitchy trials get auto-discarded. `--min-uwb-samples` does the same
-  for UWB (based on Ok range samples rather than raw lines).
+  short/glitchy trials get auto-discarded during collection. `--min-uwb-samples`
+  does the same for UWB (based on Ok range samples rather than raw lines).
+  These are a live sanity check during collection, separate from anything
+  in the cut step.
+- If `extract_features.py cut` produces zero rows for a session, check that
+  every accepted trial in `trials.csv` has a matching `trial_start`/
+  `trial_end` pair in `events.csv` (an interrupted trial won't).
 
-## Files
-
-- `gestures.py`: canonical gesture registry (names, instructions, suggested sensors).
-- `collect_gesture_dataset.py`: main multi-sensor trial-based collector.
-- `combine_gesture_datasets.py`: merge datasets from multiple collectors.
-- `sensors/serial_json_stream.py`: background-thread raw-line reader for IMU (USB serial).
-- `sensors/rfid_tcp_stream.py`: background-thread raw-line reader for the RFID reader (TCP socket, not serial).
-- `sensors/common.py`: shared timestamp/manifest/JSON helpers.
-- `mmwave/radar_io.py`: TI xWRL6432 UART protocol (adapted from `mmwave_lab`).
-- `mmwave/mmwave_stream.py`: background-thread radar frame reader with time-windowed extraction.
-- `mmwave/xwrL64xx-evm/*.cfg`: radar configs copied from `mmwave_lab`.
-- `uwb/uwb_io.py`: Qorvo FiRa TWR subprocess helpers + ranging log parser (adapted from `UWB_lab/uwb_lab_common.py`).
-- `uwb/uwb_stream.py`: background-thread anchor+node(s) ranging reader with time-windowed extraction.
-- `uwb/uwb-qorvo-tools/`: vendored Qorvo UCI/FiRa CLI (`run_fira_twr.py`, `reset_device.py`, `uci`/`uqt_utils` libs), copied from `UWB_lab`.
-- `features.py`: per-sensor baseline feature extraction from trial `.npz` files.
-- `gesture_models.py`: shared classifier builder (KNN/linear SVM) and `LateFusionClassifier`.
-- `train.py`: train + evaluate a single-sensor or fused gesture classifier (confusion matrix, held-out-person eval).
-- `eval_realtime.py`: live sliding-window gesture evaluation using a trained model.
-
-Raw recordings and trained models are ignored by git under `datasets/`,
-`sessions/`, and `models/`.
+Raw recordings, trained models, and result figures are ignored by git under
+`data/`, `sessions/`, `models/`, and `results/`.

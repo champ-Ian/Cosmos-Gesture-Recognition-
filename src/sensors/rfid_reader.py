@@ -12,14 +12,14 @@ address, not a serial port). Each line reports one tag read:
 
 e.g. `E2806995000040154D38514E 2024-01-01 12:00:00.123 -45 3`. The reader
 streams a line for every tag it sees in range, not just tags you care
-about -- filter by EPC downstream (see `features.py`) if your gestures use
-specific tags.
+about -- filter by EPC downstream (see `extract_features.py`) if your
+gestures use specific tags.
 
-Like `SerialLineStream`, this stores the **raw line** tagged with a
+Like `ImuReader`, this stores the **raw line** tagged with a
 `time.monotonic()` receive timestamp and does no parsing at capture time --
 `.window()` returns the same `list[(relative_time_s, raw_line)]` shape so
-`collect_gesture_dataset.py` and `eval_realtime.py` can treat it the same
-way as the serial sensors.
+`collect.py` and `realtime_demo.py` can treat it the same way as the serial
+sensors.
 """
 from __future__ import annotations
 
@@ -27,8 +27,10 @@ import socket
 import threading
 import time
 
+from sensors.base_reader import BaseReader
 
-class RfidTcpStream:
+
+class RfidReader(BaseReader):
     """Reads newline-terminated text lines from the RFID reader's TCP socket on a background thread."""
 
     def __init__(
@@ -83,7 +85,7 @@ class RfidTcpStream:
             raise RuntimeError(f"{self.name} TCP stream failed: {self._error}") from self._error
 
     @property
-    def line_count(self) -> int:
+    def sample_count(self) -> int:
         with self._lock:
             return len(self._buffer)
 

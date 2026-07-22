@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Train a gesture classifier from `collect_gesture_dataset.py` trials.
+Train a gesture classifier from `extract_features.py cut` trials.
 
 Modeled on `UWB_lab/train.py`: pick a sensor subset with `--sensors` (a
 single sensor gives you the "single-sensor baseline" the project rubric
@@ -11,23 +11,23 @@ Fusion type table), and a classifier to compare against another run
 
 Only trials where `sensors_enabled` (in trials.csv) includes every sensor in
 `--sensors`, and where every one of those sensors' features can actually be
-extracted (see features.py), are used -- this keeps early/late fusion runs
-and different `--sensors` choices comparable on the same underlying trials
-where possible, and reports what got skipped and why.
+extracted (see extract_features.py), are used -- this keeps early/late
+fusion runs and different `--sensors` choices comparable on the same
+underlying trials where possible, and reports what got skipped and why.
 
-Examples:
+Run from the repo root as `python src/train.py ...` (paths below assume that):
 
     # Single-sensor mmWave baseline
-    python train.py datasets/combined_gesture_dataset --sensors mmwave
+    python src/train.py data/processed/combined --sensors mmwave
 
     # Early-fusion mmWave+IMU model
-    python train.py datasets/combined_gesture_dataset --sensors mmwave,imu --fusion early
+    python src/train.py data/processed/combined --sensors mmwave,imu --fusion early
 
     # Late-fusion mmWave+IMU model (one classifier per sensor, averaged)
-    python train.py datasets/combined_gesture_dataset --sensors mmwave,imu --fusion late
+    python src/train.py data/processed/combined --sensors mmwave,imu --fusion late
 
     # Held-out-person evaluation
-    python train.py datasets/combined_gesture_dataset --sensors mmwave,imu --test-collector student03
+    python src/train.py data/processed/combined --sensors mmwave,imu --test-collector student03
 """
 from __future__ import annotations
 
@@ -39,17 +39,16 @@ from pathlib import Path
 
 import numpy as np
 
-from features import feature_names_for_sensor, feature_names_for_sensors, extract_sensor_features
+from extract_features import feature_names_for_sensor, feature_names_for_sensors, extract_sensor_features
 from gesture_models import LateFusionClassifier, build_classifier, classifier_label
-from sensors.common import timestamp
+from sensors.common import MODELS_DIR, RESULTS_FIGURES_DIR, timestamp
 
-MODELS_DIR = Path(__file__).resolve().parent / "models"
 ALL_SENSORS = ("mmwave", "imu", "uwb", "rfid")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("datasets", nargs="+", help="Dataset folders from collect_gesture_dataset.py / combine_gesture_datasets.py.")
+    parser.add_argument("datasets", nargs="+", help="Processed dataset folders from extract_features.py cut / combine_datasets.py.")
     parser.add_argument(
         "--sensors",
         required=True,
@@ -67,8 +66,8 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="Hold out this collector as the test set (all others train). Repeatable/comma separated.",
     )
-    parser.add_argument("--model-out", help="Output .joblib path. Default: <dataset>/models/... or ./models/...")
-    parser.add_argument("--confusion-out", help="Output confusion matrix PNG. Default is next to the model.")
+    parser.add_argument("--model-out", help="Output .joblib path. Default: <repo>/models/<classifier>_<fusion>_<sensors>_<timestamp>.joblib")
+    parser.add_argument("--confusion-out", help="Output confusion matrix PNG. Default: <repo>/results/figures/.")
     return parser.parse_args()
 
 
@@ -222,11 +221,9 @@ def split_indices(y: np.ndarray, collectors: np.ndarray, args: argparse.Namespac
     return train_idx, test_idx, "random"
 
 
-def default_model_path(dataset_dirs: list[Path], classifier: str, fusion: str, sensors: list[str]) -> Path:
+def default_model_path(classifier: str, fusion: str, sensors: list[str]) -> Path:
     tag = "-".join(sensors)
     name = f"{classifier}_{fusion}_{tag}_{timestamp()}.joblib"
-    if len(dataset_dirs) == 1:
-        return dataset_dirs[0] / "models" / name
     return MODELS_DIR / name
 
 
@@ -299,7 +296,7 @@ def main() -> int:
     labels_order = sorted(set(y))
     matrix = confusion_matrix(y_test, predictions, labels=labels_order)
 
-    model_out = Path(args.model_out) if args.model_out else default_model_path(dataset_dirs, args.classifier, args.fusion, sensors)
+    model_out = Path(args.model_out) if args.model_out else default_model_path(args.classifier, args.fusion, sensors)
     model_out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model": model,
@@ -317,7 +314,10 @@ def main() -> int:
     }
     joblib.dump(payload, model_out)
 
-    confusion_out = Path(args.confusion_out) if args.confusion_out else model_out.with_name(model_out.stem + "_confusion_matrix.png")
+    confusion_out = (
+        Path(args.confusion_out) if args.confusion_out else RESULTS_FIGURES_DIR / (model_out.stem + "_confusion_matrix.png")
+    )
+    confusion_out.parent.mkdir(parents=True, exist_ok=True)
     display = ConfusionMatrixDisplay(confusion_matrix=matrix, display_labels=labels_order)
     fig, ax = plt.subplots(figsize=(6, 5))
     display.plot(ax=ax, cmap="Blues", colorbar=False, xticks_rotation=45)

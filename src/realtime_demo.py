@@ -5,19 +5,19 @@ Live/near-real-time gesture evaluation using a model trained by `train.py`.
 Modeled on `UWB_lab/eval_realtime.py`: opens whichever sensor streams the
 loaded model actually needs (`payload["sensors"]`), keeps a sliding time
 window per sensor, extracts the same features used during training (see
-features.py), predicts every `--step-seconds`, and optionally smooths raw
-predictions over `--vote-window` recent predictions via majority vote.
-Predictions are printed live and saved to
+extract_features.py), predicts every `--step-seconds`, and optionally
+smooths raw predictions over `--vote-window` recent predictions via
+majority vote. Predictions are printed live and saved to
 `sessions/eval_<name>/realtime_predictions.csv`.
 
 Only pass the `--*-port` flags for sensors your model actually uses --
 `train.py --sensors` records which ones that is, and this script tells you
 plainly if a required port is missing.
 
-Example (a model trained on mmWave + IMU):
+Example (run from the repo root; a model trained on mmWave + IMU):
 
-    python eval_realtime.py \\
-      --model datasets/combined_gesture_dataset/models/knn_early_mmwave-imu_20260101_120000.joblib \\
+    python src/realtime_demo.py \\
+      --model models/knn_early_mmwave-imu_20260101_120000.joblib \\
       --mmwave-port /dev/cu.usbserial-XXXX \\
       --imu-port /dev/cu.usbserial-YYYY \\
       --duration 60 --window-seconds 3 --step-seconds 0.5 --vote-window 5
@@ -33,14 +33,16 @@ from pathlib import Path
 
 import numpy as np
 
-from features import extract_sensor_features
-from mmwave.mmwave_stream import MmwaveStream
-from sensors.common import timestamp
-from sensors.rfid_tcp_stream import RfidTcpStream
-from sensors.serial_json_stream import SerialLineStream
-from uwb.uwb_stream import UwbStream
+from extract_features import extract_sensor_features
+from sensors.common import REPO_DIR, timestamp
+from sensors.imu_reader import ImuReader
+from sensors.mmwave_reader import MmwaveReader
+from sensors.rfid_reader import RfidReader
+from sensors.uwb_reader import UwbReader
 
-DEFAULT_MMWAVE_CFG = Path("mmwave/xwrL64xx-evm/near_field_hand_50cm.cfg")
+# Resolved relative to this file (src/), not the current working directory --
+# see collect.py's DEFAULT_MMWAVE_CFG for why.
+DEFAULT_MMWAVE_CFG = Path(__file__).resolve().parent / "mmwave" / "xwrL64xx-evm" / "near_field_hand_50cm.cfg"
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Majority-vote over this many recent raw predictions. 1 = show raw predictions.",
     )
-    parser.add_argument("--out-root", default="sessions")
+    parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
 
     mmwave_group = parser.add_argument_group("mmWave radar (TI xWRL6432)")
@@ -104,7 +106,7 @@ def open_streams(args: argparse.Namespace, required_sensors: list[str], session_
             if not args.mmwave_port:
                 raise SystemExit("This model needs mmWave -- pass --mmwave-port.")
             print(f"Opening mmWave radar on {args.mmwave_port} (cfg: {args.mmwave_cfg})...")
-            streams["mmwave"] = MmwaveStream(
+            streams["mmwave"] = MmwaveReader(
                 port_path=args.mmwave_port,
                 cfg_path=args.mmwave_cfg,
                 baud=args.mmwave_baud,
@@ -114,14 +116,14 @@ def open_streams(args: argparse.Namespace, required_sensors: list[str], session_
             if not args.imu_port:
                 raise SystemExit("This model needs IMU -- pass --imu-port.")
             print(f"Opening IMU on {args.imu_port}...")
-            streams["imu"] = SerialLineStream("imu", args.imu_port, args.imu_baud)
+            streams["imu"] = ImuReader("imu", args.imu_port, args.imu_baud)
         if "uwb" in required_sensors:
             if not args.uwb_anchor_port or not args.uwb_node_port:
                 raise SystemExit("This model needs UWB -- pass --uwb-anchor-port and --uwb-node-port.")
             if args.uwb_group_id is None:
                 raise SystemExit("--uwb-group-id is required when UWB is enabled.")
             print(f"Opening UWB (anchor {args.uwb_anchor_port}, nodes {', '.join(args.uwb_node_port)})...")
-            streams["uwb"] = UwbStream(
+            streams["uwb"] = UwbReader(
                 anchor_port=args.uwb_anchor_port,
                 node_ports=args.uwb_node_port,
                 group_id=args.uwb_group_id,
@@ -135,7 +137,7 @@ def open_streams(args: argparse.Namespace, required_sensors: list[str], session_
             )
         if "rfid" in required_sensors:
             print(f"Opening RFID reader at {args.rfid_host}:{args.rfid_tcp_port}...")
-            streams["rfid"] = RfidTcpStream(args.rfid_host, args.rfid_tcp_port)
+            streams["rfid"] = RfidReader(args.rfid_host, args.rfid_tcp_port)
     except Exception:
         close_streams(streams)
         raise
@@ -151,7 +153,7 @@ def close_streams(streams: dict) -> None:
 
 
 def window_to_feature_input(sensor: str, window) -> dict:
-    """Adapt a live stream's `.window()` output to the `{sensor}_*` keys features.py expects."""
+    """Adapt a live stream's `.window()` output to the `{sensor}_*` keys extract_features.py expects."""
     if sensor == "mmwave":
         return {
             "mmwave_frame_number": window["frame_number"],

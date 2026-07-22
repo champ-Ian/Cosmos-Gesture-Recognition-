@@ -40,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 
+from sensors.base_reader import BaseReader
 from uwb.uwb_io import (
     RangeLogParser,
     compute_ranging_span_ms,
@@ -51,7 +52,7 @@ from uwb.uwb_io import (
 )
 
 
-class UwbStream:
+class UwbReader(BaseReader):
     """Runs an anchor+node(s) FiRa TWR setup and buffers parsed range samples."""
 
     def __init__(
@@ -72,8 +73,9 @@ class UwbStream:
         session_duration_s: int = 3600,
     ) -> None:
         if not node_ports:
-            raise ValueError("UwbStream needs at least one node port.")
+            raise ValueError("UwbReader needs at least one node port.")
 
+        self.name = "uwb"
         self.anchor_port = anchor_port
         self.node_ports = list(node_ports)
         self.group_id = group_id

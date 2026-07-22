@@ -7,11 +7,15 @@ dataset's `trials.csv` manifest (rewriting `session_dir`/`npz_path` to
 absolute paths so the combined dataset can be moved), and writes a merged
 `dataset_metadata.json` with per-gesture and per-collector counts.
 
-Usage:
-    python combine_gesture_datasets.py \\
-        datasets/gesture_dataset_STUDENT_A \\
-        datasets/gesture_dataset_STUDENT_B \\
-        --output datasets/combined_gesture_dataset
+Operates on *processed* datasets (the output of `extract_features.py cut`,
+under `data/processed/`), not raw `collect.py` sessions -- cut each
+collector's raw session first, then combine the processed datasets here.
+
+Usage (run from the repo root):
+    python src/combine_datasets.py \\
+        data/processed/STUDENT_A \\
+        data/processed/STUDENT_B \\
+        --output data/processed/combined
 """
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from collect_gesture_dataset import INPUT_TYPE, MANIFEST_FIELDNAMES
+from extract_features import INPUT_TYPE, MANIFEST_FIELDNAMES
 from sensors.common import REPO_DIR, source_dataset_name, timestamp
 
 
@@ -31,12 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "datasets",
         nargs="+",
-        help="Dataset folders created by collect_gesture_dataset.py.",
+        help="Processed dataset folders created by extract_features.py cut.",
     )
     parser.add_argument(
         "--output",
-        default=str(REPO_DIR / "datasets" / f"combined_gesture_dataset_{timestamp()}"),
-        help="Output dataset folder. Default: datasets/combined_gesture_dataset_<timestamp>",
+        default=str(REPO_DIR / "data" / "processed" / f"combined_{timestamp()}"),
+        help="Output dataset folder. Default: data/processed/combined_<timestamp>",
     )
     parser.add_argument(
         "--collector",

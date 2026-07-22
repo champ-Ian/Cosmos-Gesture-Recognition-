@@ -8,7 +8,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-REPO_DIR = Path(__file__).resolve().parent.parent
+# common.py lives at <repo>/src/sensors/common.py -- three parents up is the
+# repo root (sibling of src/, where data/, models/, results/ live per the
+# final-project skeleton).
+REPO_DIR = Path(__file__).resolve().parent.parent.parent
+DATA_RAW_DIR = REPO_DIR / "data" / "raw"
+DATA_PROCESSED_DIR = REPO_DIR / "data" / "processed"
+MODELS_DIR = REPO_DIR / "models"
+RESULTS_FIGURES_DIR = REPO_DIR / "results" / "figures"
 
 
 def timestamp() -> str:

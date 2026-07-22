@@ -4,7 +4,7 @@ Canonical gesture registry for the COSMOS gesture-recognition final project.
 
 Keeping this list in one place means every script (collector, combiner,
 future training/eval code) uses the same label spelling. `--gesture` on
-`collect_gesture_dataset.py` accepts these canonical (snake_case) names.
+`collect.py` accepts these canonical (snake_case) names.
 """
 from __future__ import annotations
 
@@ -17,6 +17,14 @@ class GestureSpec:
     display_name: str
     instruction: str
     suggested_sensors: tuple[str, ...]
+    # "discrete": one clean instance per trial, clear start/end (collect.py
+    #   prompts trial-by-trial, --duration each).
+    # "periodic": repeated cycles with no natural single boundary --
+    #   collect.py records one long continuous take instead, and
+    #   extract_features.py's cut step segments it into fixed-length windows
+    #   afterward. Grouping follows the final-project implementation hints
+    #   (Shanmu Wang): periodic = clapping, boxing, palm up-down, soli.
+    group: str = "discrete"
 
 
 # Suggested sensor combination per gesture, based on the group's sensing plan:
@@ -70,21 +78,24 @@ GESTURES: dict[str, GestureSpec] = {
         GestureSpec(
             "one_arm_boxing",
             "One-Arm Boxing",
-            "Throw a single punch forward with one arm, then retract. IMU on the punching wrist, "
-            "UWB tag tracks distance change to the anchor.",
+            "Throw repeated punches forward with one arm, retracting between each. IMU on the "
+            "punching wrist, UWB tag tracks distance change to the anchor.",
             ("imu", "uwb"),
+            group="periodic",
         ),
         GestureSpec(
             "clapping",
             "Clapping",
             "Clap your hands together repeatedly in front of the sensors.",
             ("mmwave", "imu"),
+            group="periodic",
         ),
         GestureSpec(
             "two_arm_boxing",
             "Two-Arm Boxing",
             "Throw alternating punches with both arms; UWB distance-to-anchor should change with each punch.",
             ("imu", "uwb"),
+            group="periodic",
         ),
         GestureSpec(
             "t_arm",
@@ -101,9 +112,10 @@ GESTURES: dict[str, GestureSpec] = {
         GestureSpec(
             "soli",
             "Soli",
-            "Move your fingers/hand near the RFID copper-wire antenna without touching it "
-            "(micro-gesture, like Google Soli).",
+            "Move your fingers/hand near the RFID copper-wire antenna without touching it, "
+            "repeatedly (micro-gesture, like Google Soli).",
             ("rfid",),
+            group="periodic",
         ),
         GestureSpec(
             "fist_open",
@@ -116,6 +128,7 @@ GESTURES: dict[str, GestureSpec] = {
             "Palm Up-Down",
             "With the IMU strapped to the back of your hand, rotate your palm face-up then face-down, repeatedly.",
             ("imu",),
+            group="periodic",
         ),
     )
 }

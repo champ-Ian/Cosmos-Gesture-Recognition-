@@ -6,13 +6,13 @@ Runs `radar_io.read_frame` continuously on its own thread so the radar can be
 captured in parallel with the other IoT sensors (IMU / UWB / RFID), each on
 its own serial port. Frames are timestamped with `time.monotonic()` so a
 collection script can slice out the frames that fall inside a given gesture
-trial window, the same way the JSON-line sensors are windowed.
+trial window, the same way the text-line sensors are windowed.
 """
 from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +31,7 @@ from mmwave.radar_io import (
     stop_and_drain,
     warm_reset_demo,
 )
+from sensors.base_reader import BaseReader
 
 
 @dataclass
@@ -42,7 +43,7 @@ class RadarFrameRecord:
     points_velocity: np.ndarray
 
 
-class MmwaveStream:
+class MmwaveReader(BaseReader):
     """Continuously reads radar frames on a background thread."""
 
     def __init__(
@@ -53,6 +54,7 @@ class MmwaveStream:
         frame_timeout_s: float = 5.0,
         warm_reset: bool = True,
     ) -> None:
+        self.name = "mmwave"
         self.port_path = port_path
         self.cfg_path = cfg_path
         self.frame_timeout_s = frame_timeout_s
@@ -118,6 +120,10 @@ class MmwaveStream:
     def frame_count(self) -> int:
         with self._lock:
             return len(self._buffer)
+
+    @property
+    def sample_count(self) -> int:
+        return self.frame_count
 
     def check_error(self) -> None:
         if self._error is not None:

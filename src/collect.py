@@ -35,9 +35,10 @@ Output layout (`data/raw/session_<collector>_<timestamp>/`):
     imu.csv, uwb.csv, rfid.csv, mmwave.npz   (whichever sensors are enabled)
     uwb_logs/                  (UWB anchor/node subprocess logs, if enabled)
 
-Example (all four sensors, discrete + periodic gestures in one session):
+Example (run from the repo root; all four sensors, discrete + periodic
+gestures in one session):
 
-    python collect.py \\
+    python src/collect.py \\
         --collector student01 \\
         --mmwave-port /dev/cu.usbserial-XXXX \\
         --imu-port /dev/cu.usbserial-YYYY \\
@@ -50,7 +51,7 @@ Example (all four sensors, discrete + periodic gestures in one session):
 
 Then cut the raw session into a processed dataset:
 
-    python extract_features.py cut data/raw/session_student01_... \\
+    python src/extract_features.py cut data/raw/session_student01_... \\
         --output data/processed/student01_session1
 """
 from __future__ import annotations
@@ -64,13 +65,17 @@ import numpy as np
 
 from extract_features import parse_imu_line, parse_rfid_line
 from gestures import GESTURES, normalize_gestures
-from sensors.common import safe_label, timestamp, write_json
+from sensors.common import DATA_PROCESSED_DIR, DATA_RAW_DIR, safe_label, timestamp, write_json
 from sensors.imu_reader import ImuReader
 from sensors.mmwave_reader import MmwaveReader
 from sensors.rfid_reader import RfidReader
 from sensors.uwb_reader import UwbReader
 
-DEFAULT_MMWAVE_CFG = Path("mmwave/xwrL64xx-evm/near_field_hand_50cm.cfg")
+# Resolved relative to this file (src/), not the current working directory,
+# so `--mmwave-cfg` defaults correctly whether you run this as
+# `python src/collect.py` from the repo root or `python collect.py` from
+# inside src/.
+DEFAULT_MMWAVE_CFG = Path(__file__).resolve().parent / "mmwave" / "xwrL64xx-evm" / "near_field_hand_50cm.cfg"
 
 EVENTS_FIELDNAMES = ["time_s", "event", "trial_id", "gesture", "collector"]
 TRIALS_FIELDNAMES = [
@@ -111,7 +116,7 @@ def parse_args() -> argparse.Namespace:
         help="Seconds per periodic-gesture continuous take (segmented later by extract_features.py cut).",
     )
     parser.add_argument("--dataset-name", default=f"session_{timestamp()}")
-    parser.add_argument("--out-root", default="data/raw")
+    parser.add_argument("--out-root", default=str(DATA_RAW_DIR))
     parser.add_argument("--auto-accept", action="store_true")
     parser.add_argument(
         "--min-mmwave-frames", type=int, default=10, help="Only checked if --mmwave-port is set."
@@ -648,8 +653,8 @@ def main() -> int:
     print(f"Accepted trials: {accepted_total}")
     print(f"Raw session complete: {session_dir}")
     print(
-        "Next: python extract_features.py cut "
-        f"{session_dir} --output data/processed/{args.dataset_name}"
+        "Next: python src/extract_features.py cut "
+        f"{session_dir} --output {DATA_PROCESSED_DIR / args.dataset_name}"
     )
     return 1 if interrupted else 0
 
