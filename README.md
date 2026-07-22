@@ -19,7 +19,7 @@ your own recorded data.
 | --- | --- |
 | mmWave radar (TI xWRL6432/IWR6432, from `mmwave_lab`) | Range profile + point cloud of arm/hand motion. |
 | IMU (ESP32 Core2) | Wrist/hand-worn accelerometer + gyroscope. |
-| UWB (up to 3x Qorvo DWM3001CDK, from `UWB_lab`) | FiRa two-way-ranging distance from a worn tag to one or more fixed anchors. |
+| UWB (3x Qorvo DWM3001CDK, from `UWB_lab`) | FiRa two-way-ranging distance from 1 fixed anchor to 2 worn nodes (one per wrist/arm). |
 | RFID reader + tags | Near-field hand/finger sensing (Soli-style micro-gestures, fist open/close). |
 
 Not every gesture needs every sensor — see `gestures.py` for the
@@ -82,27 +82,29 @@ stored either way. Feature extraction (parsing these lines into numeric
 arrays for training) is a separate step once your team locks in the actual
 line format; it only needs to change a parser, not recollect data.
 
-### UWB wiring (Qorvo DWM3001CDK FiRa ranging: tag + anchor(s))
+### UWB wiring (Qorvo DWM3001CDK FiRa ranging: anchor + node(s))
 
 Unlike IMU/RFID, the UWB kit is **not** a single JSON-line tag: it's the same
 Qorvo DWM3001CDK boards as `UWB_lab`, running FiRa two-way ranging (TWR)
-between a worn **tag** (FiRa "controller" role) and one or more fixed
-**anchors** (FiRa "controlee" role). Each board needs its own serial port
-(`ls /dev/cu.usbmodem*` on macOS), and every board in the setup must use the
-same class-sheet-assigned preamble code and channel.
+between one fixed **anchor** (FiRa "controller" role) and one or more worn
+**nodes** (FiRa "controlee" role) — this project's kit is 1 anchor + 2 nodes
+(e.g. one node per wrist/arm), so each gesture gets two independent
+distance-from-anchor signals instead of one. Each board needs its own serial
+port (`ls /dev/cu.usbmodem*` on macOS), and every board in the setup must use
+the same class-sheet-assigned preamble code and channel.
 
 `uwb/uwb_stream.py` drives this the same way `UWB_lab/ranging_experiment_wrapper.py`
 does: it launches the vendored `uwb/uwb-qorvo-tools/scripts/fira/run_fira_twr/run_fira_twr.py`
 as a subprocess per board (resetting all devices first via UCI), then parses
-the tag's `distance: X cm` / `status: Ok (0x0)` / `mac address: ...` stdout
-lines with a regex-based log parser. Only the tag reports distance; anchors
-just need to be running so the tag has something to range against.
+the anchor's `distance: X cm` / `status: Ok (0x0)` / `mac address: ...` stdout
+lines with a regex-based log parser. Only the anchor reports distance; nodes
+just need to be running so the anchor has something to range against.
 
 Required flags when UWB is enabled:
 
 ```text
---uwb-tag-port /dev/cu.usbmodemXXXX
---uwb-anchor-port /dev/cu.usbmodemYYYY   # repeat --uwb-anchor-port for more anchors
+--uwb-anchor-port /dev/cu.usbmodemXXXX
+--uwb-node-port /dev/cu.usbmodemYYYY   # repeat --uwb-node-port for more nodes
 --uwb-group-id <class-sheet group number>
 --uwb-preamble-code <9|10|11|12, from the class sheet>
 --uwb-channel <5|9, from the class sheet>
@@ -111,22 +113,23 @@ Required flags when UWB is enabled:
 `--uwb-fps` (default 50), `--uwb-slot-span` (default 2400), and
 `--uwb-slots-per-rr` control the ranging timing.
 
-**Single anchor** (one `--uwb-anchor-port`): plain FiRa unicast TWR, exactly
+**Single node** (one `--uwb-node-port`): plain FiRa unicast TWR, exactly
 `UWB_lab`'s documented controller/controlee lab exercise — `--uwb-slots-per-rr`
 defaults to 6, same as that lab.
 
-**Multiple anchors** (two or more `--uwb-anchor-port` flags): the tag ranges
-against all anchors using FiRa "one-to-many" mode (`uwb-qorvo-tools`'s own
-`--node`/`--n_controlees`/`--mac`/`--dest-mac` flags), with each anchor
-assigned a distinct MAC address and every sample tagged with which anchor's
+**Multiple nodes** (two or more `--uwb-node-port` flags, i.e. this project's
+1 anchor + 2 nodes): the anchor ranges against all nodes using FiRa
+"one-to-many" mode (`uwb-qorvo-tools`'s own
+`--node`/`--n_controlees`/`--mac`/`--dest-mac` flags), with each node
+assigned a distinct MAC address and every sample tagged with which node's
 MAC it came from (`uwb_mac_address` in the saved `.npz`, see below).
 **This path is not exercised by `UWB_lab`'s documented lab and has not been
 verified against physical DWM3001CDK hardware** — `--uwb-slots-per-rr`
-defaults to a heuristic (`6 * anchor count`) that may need tuning. Before
+defaults to a heuristic (`6 * node count`) that may need tuning. Before
 trusting it for real data collection, run a short (`--trials 1 --duration 3`)
-smoke test and check `datasets/<name>/uwb_logs/tag/tag_terminal_log.txt` for
-`status: Ok` against every anchor's MAC — if ranging is unstable or an
-anchor never shows `Ok`, try increasing `--uwb-slots-per-rr` first.
+smoke test and check `datasets/<name>/uwb_logs/anchor/anchor_terminal_log.txt`
+for `status: Ok` against every node's MAC — if ranging is unstable or a node
+never shows `Ok`, try increasing `--uwb-slots-per-rr` first.
 
 Per-board logs and device-reset logs are written under
 `datasets/<dataset_name>/uwb_logs/`.
@@ -144,10 +147,10 @@ python collect_gesture_dataset.py \
   --collector student01 \
   --mmwave-port /dev/cu.usbserial-AAAA \
   --imu-port /dev/cu.usbserial-BBBB \
-  --uwb-tag-port /dev/cu.usbmodemCCCC \
-  --uwb-anchor-port /dev/cu.usbmodemDDDD \
+  --uwb-anchor-port /dev/cu.usbmodemCCCC \
+  --uwb-node-port /dev/cu.usbmodemDDDD --uwb-node-port /dev/cu.usbmodemEEEE \
   --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \
-  --rfid-port /dev/cu.usbserial-EEEE \
+  --rfid-port /dev/cu.usbserial-FFFF \
   --gesture pull,push,clockwise,anti_clockwise \
   --trials 5 \
   --duration 4
@@ -181,7 +184,7 @@ Output layout:
 datasets/gesture_dataset_YYYYMMDD_HHMMSS/
   dataset_metadata.json
   trials.csv
-  uwb_logs/                 # only if UWB was enabled: device-reset + tag/anchor logs
+  uwb_logs/                 # only if UWB was enabled: device-reset + anchor/node logs
   sessions/
     gesture_student01_pull_001/
       trial_data.npz
@@ -195,9 +198,9 @@ Each `trial_data.npz` holds, per enabled sensor:
 - IMU/RFID: `{sensor}_recv_time_s` and `{sensor}_raw_lines` (raw text, one
   entry per line received during the trial window).
 - UWB: `uwb_time_s`, `uwb_sequence`, `uwb_mac_address`, `uwb_status`,
-  `uwb_distance_cm` (one entry per parsed ranging sample from the tag; with
-  multiple anchors, `uwb_mac_address` is what tells samples from different
-  anchors apart).
+  `uwb_distance_cm` (one entry per parsed ranging sample from the anchor;
+  with multiple nodes, `uwb_mac_address` is what tells samples from
+  different nodes apart).
 
 ### Combining datasets from multiple group members
 
@@ -294,11 +297,12 @@ and are saved to `sessions/eval_<name>/realtime_predictions.csv`.
 - If UWB produces zero Ok samples: confirm all boards are on the
   class-sheet-assigned preamble code/channel, that no other terminal/process
   already has any port open, and check
-  `datasets/<dataset_name>/uwb_logs/tag/tag_terminal_log.txt` for the raw
-  `run_fira_twr.py` output. Use `--uwb-skip-device-reset` only if the boards
-  are already known-good — a bad reset is a common cause of a silent tag.
-  With multiple anchors, if only some anchors' MACs ever show `status: Ok`,
-  try raising `--uwb-slots-per-rr` first (see the UWB wiring section above).
+  `datasets/<dataset_name>/uwb_logs/anchor/anchor_terminal_log.txt` for the
+  raw `run_fira_twr.py` output. Use `--uwb-skip-device-reset` only if the
+  boards are already known-good — a bad reset is a common cause of a silent
+  anchor. With multiple nodes, if only some nodes' MACs ever show
+  `status: Ok`, try raising `--uwb-slots-per-rr` first (see the UWB wiring
+  section above).
 - `Ctrl+C` stops the collector cleanly; it sends `sensorStop 0` to the radar,
   resets the UWB boards, and closes all serial ports/subprocesses before
   exiting.
@@ -317,7 +321,7 @@ and are saved to `sessions/eval_<name>/realtime_predictions.csv`.
 - `mmwave/mmwave_stream.py`: background-thread radar frame reader with time-windowed extraction.
 - `mmwave/xwrL64xx-evm/*.cfg`: radar configs copied from `mmwave_lab`.
 - `uwb/uwb_io.py`: Qorvo FiRa TWR subprocess helpers + ranging log parser (adapted from `UWB_lab/uwb_lab_common.py`).
-- `uwb/uwb_stream.py`: background-thread tag+anchor(s) ranging reader with time-windowed extraction.
+- `uwb/uwb_stream.py`: background-thread anchor+node(s) ranging reader with time-windowed extraction.
 - `uwb/uwb-qorvo-tools/`: vendored Qorvo UCI/FiRa CLI (`run_fira_twr.py`, `reset_device.py`, `uci`/`uqt_utils` libs), copied from `UWB_lab`.
 - `features.py`: per-sensor baseline feature extraction from trial `.npz` files.
 - `gesture_models.py`: shared classifier builder (KNN/linear SVM) and `LateFusionClassifier`.

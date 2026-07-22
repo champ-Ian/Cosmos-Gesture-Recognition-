@@ -11,10 +11,11 @@ run several sensors concurrently on independent background threads:
     - IMU (ESP32 Core2), RFID reader: newline-delimited serial text, read raw
       by `sensors/serial_json_stream.py` (see that file for the
       expected/recommended JSON-line firmware contract).
-    - UWB: a Qorvo DWM3001CDK tag + one-or-more-anchors FiRa ranging setup,
-      driven by `uwb/uwb_stream.py` (adapted from `UWB_lab`). This needs a
-      tag port (`--uwb-tag-port`) plus at least one anchor port
-      (`--uwb-anchor-port`, repeatable for multi-anchor ranging), not one
+    - UWB: a Qorvo DWM3001CDK anchor + one-or-more-nodes FiRa ranging setup
+      (this project's kit: 1 fixed anchor + 2 worn nodes), driven by
+      `uwb/uwb_stream.py` (adapted from `UWB_lab`). This needs an anchor
+      port (`--uwb-anchor-port`) plus at least one node port
+      (`--uwb-node-port`, repeatable for multi-node ranging), not one
       single port.
 
 Every enabled sensor streams continuously into its own timestamped buffer.
@@ -34,8 +35,8 @@ Example (all four sensors):
         --collector student01 \\
         --mmwave-port /dev/cu.usbserial-XXXX \\
         --imu-port /dev/cu.usbserial-YYYY \\
-        --uwb-tag-port /dev/cu.usbmodemZZZZ \\
-        --uwb-anchor-port /dev/cu.usbmodemWWWW --uwb-anchor-port /dev/cu.usbmodemVVVV \\
+        --uwb-anchor-port /dev/cu.usbmodemZZZZ \\
+        --uwb-node-port /dev/cu.usbmodemWWWW --uwb-node-port /dev/cu.usbmodemVVVV \\
         --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
         --rfid-port /dev/cu.usbserial-WWWW \\
         --gesture pull,push,clockwise,anti_clockwise \\
@@ -135,17 +136,18 @@ def parse_args() -> argparse.Namespace:
     imu_group.add_argument("--imu-port", help="IMU serial port.")
     imu_group.add_argument("--imu-baud", type=int, default=115200)
 
-    uwb_group = parser.add_argument_group("UWB (Qorvo DWM3001CDK FiRa TWR: tag + anchor(s))")
-    uwb_group.add_argument("--uwb-tag-port", help="UWB tag (worn, FiRa controller) serial port.")
+    uwb_group = parser.add_argument_group("UWB (Qorvo DWM3001CDK FiRa TWR: anchor + node(s))")
+    uwb_group.add_argument("--uwb-anchor-port", help="UWB anchor (fixed, FiRa controller) serial port.")
     uwb_group.add_argument(
-        "--uwb-anchor-port",
+        "--uwb-node-port",
         action="append",
         help=(
-            "UWB anchor (fixed, FiRa controlee) serial port. Repeat for multiple anchors "
-            "(e.g. --uwb-anchor-port /dev/... --uwb-anchor-port /dev/...) to range the tag "
-            "against more than one anchor at once via FiRa one-to-many mode. NOTE: the "
-            "one-to-many (multi-anchor) path is unverified against real DWM3001CDK hardware -- "
-            "smoke-test it before relying on it for real data collection."
+            "UWB node (worn, FiRa controlee) serial port. Repeat for multiple nodes "
+            "(e.g. --uwb-node-port /dev/... --uwb-node-port /dev/...) -- this project's kit "
+            "is 1 anchor + 2 nodes -- to range the anchor against more than one node at once "
+            "via FiRa one-to-many mode. NOTE: the one-to-many (multi-node) path is unverified "
+            "against real DWM3001CDK hardware -- smoke-test it before relying on it for real "
+            "data collection."
         ),
     )
     uwb_group.add_argument(
@@ -167,9 +169,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Slots per ranging round. Default: 6 for a single anchor (matches UWB_lab); "
-            "6 * anchor count for multiple anchors (unverified heuristic -- increase this "
-            "if multi-anchor ranging is unstable or drops anchors)."
+            "Slots per ranging round. Default: 6 for a single node (matches UWB_lab); "
+            "6 * node count for multiple nodes (unverified heuristic -- increase this "
+            "if multi-node ranging is unstable or drops nodes)."
         ),
     )
     uwb_group.add_argument(
@@ -215,12 +217,12 @@ class SensorSet:
         self.uwb: UwbStream | None = None
         self.rfid: SerialLineStream | None = None
 
-        if bool(args.uwb_tag_port) != bool(args.uwb_anchor_port):
+        if bool(args.uwb_anchor_port) != bool(args.uwb_node_port):
             raise SystemExit(
-                "UWB needs both --uwb-tag-port and at least one --uwb-anchor-port "
-                "(it's a tag+anchor ranging setup, not a single device)."
+                "UWB needs both --uwb-anchor-port and at least one --uwb-node-port "
+                "(it's an anchor+node ranging setup, not a single device)."
             )
-        if args.uwb_tag_port and args.uwb_group_id is None:
+        if args.uwb_anchor_port and args.uwb_group_id is None:
             raise SystemExit("--uwb-group-id is required when UWB is enabled.")
 
         try:
@@ -235,14 +237,14 @@ class SensorSet:
             if args.imu_port:
                 print(f"Opening IMU on {args.imu_port}...")
                 self.imu = SerialLineStream("imu", args.imu_port, args.imu_baud)
-            if args.uwb_tag_port:
+            if args.uwb_anchor_port:
                 print(
-                    f"Opening UWB ranging (tag {args.uwb_tag_port}, "
-                    f"anchors {', '.join(args.uwb_anchor_port)})..."
+                    f"Opening UWB ranging (anchor {args.uwb_anchor_port}, "
+                    f"nodes {', '.join(args.uwb_node_port)})..."
                 )
                 self.uwb = UwbStream(
-                    tag_port=args.uwb_tag_port,
-                    anchor_ports=args.uwb_anchor_port,
+                    anchor_port=args.uwb_anchor_port,
+                    node_ports=args.uwb_node_port,
                     group_id=args.uwb_group_id,
                     log_dir=Path(args.out_root).expanduser().resolve()
                     / args.dataset_name
@@ -265,7 +267,7 @@ class SensorSet:
             self.close()
             raise SystemExit(
                 "No sensors enabled. Pass at least one of --mmwave-port, --imu-port, "
-                "--uwb-tag-port/--uwb-anchor-port, --rfid-port."
+                "--uwb-anchor-port/--uwb-node-port, --rfid-port."
             )
 
         # Let boards settle and start producing data before the first trial.
@@ -466,8 +468,8 @@ def make_dataset_metadata(args: argparse.Namespace, gesture_list: list[str], sen
         "ports": {
             "mmwave": args.mmwave_port,
             "imu": args.imu_port,
-            "uwb_tag": args.uwb_tag_port,
-            "uwb_anchors": args.uwb_anchor_port,
+            "uwb_anchor": args.uwb_anchor_port,
+            "uwb_nodes": args.uwb_node_port,
             "rfid": args.rfid_port,
         },
         "uwb_config": (
@@ -479,7 +481,7 @@ def make_dataset_metadata(args: argparse.Namespace, gesture_list: list[str], sen
                 "ranging_span_ms": sensors.uwb.ranging_span_ms,
                 "slot_span": args.uwb_slot_span,
                 "slots_per_rr": sensors.uwb.slots_per_rr,
-                "multi_anchor": sensors.uwb.multi_anchor,
+                "multi_node": sensors.uwb.multi_node,
             }
             if sensors.uwb is not None
             else None

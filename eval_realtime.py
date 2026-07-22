@@ -67,9 +67,9 @@ def parse_args() -> argparse.Namespace:
     imu_group.add_argument("--imu-port")
     imu_group.add_argument("--imu-baud", type=int, default=115200)
 
-    uwb_group = parser.add_argument_group("UWB (Qorvo DWM3001CDK FiRa TWR: tag + anchor(s))")
-    uwb_group.add_argument("--uwb-tag-port")
-    uwb_group.add_argument("--uwb-anchor-port", action="append")
+    uwb_group = parser.add_argument_group("UWB (Qorvo DWM3001CDK FiRa TWR: anchor + node(s))")
+    uwb_group.add_argument("--uwb-anchor-port")
+    uwb_group.add_argument("--uwb-node-port", action="append")
     uwb_group.add_argument("--uwb-group-id", type=int)
     uwb_group.add_argument("--uwb-preamble-code", type=int, default=10)
     uwb_group.add_argument("--uwb-channel", type=int, choices=[5, 9], default=9)
@@ -115,14 +115,14 @@ def open_streams(args: argparse.Namespace, required_sensors: list[str], session_
             print(f"Opening IMU on {args.imu_port}...")
             streams["imu"] = SerialLineStream("imu", args.imu_port, args.imu_baud)
         if "uwb" in required_sensors:
-            if not args.uwb_tag_port or not args.uwb_anchor_port:
-                raise SystemExit("This model needs UWB -- pass --uwb-tag-port and --uwb-anchor-port.")
+            if not args.uwb_anchor_port or not args.uwb_node_port:
+                raise SystemExit("This model needs UWB -- pass --uwb-anchor-port and --uwb-node-port.")
             if args.uwb_group_id is None:
                 raise SystemExit("--uwb-group-id is required when UWB is enabled.")
-            print(f"Opening UWB (tag {args.uwb_tag_port}, anchors {', '.join(args.uwb_anchor_port)})...")
+            print(f"Opening UWB (anchor {args.uwb_anchor_port}, nodes {', '.join(args.uwb_node_port)})...")
             streams["uwb"] = UwbStream(
-                tag_port=args.uwb_tag_port,
-                anchor_ports=args.uwb_anchor_port,
+                anchor_port=args.uwb_anchor_port,
+                node_ports=args.uwb_node_port,
                 group_id=args.uwb_group_id,
                 log_dir=session_dir / "uwb_logs",
                 preamble_code=args.uwb_preamble_code,

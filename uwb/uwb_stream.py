@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
 """
-Background reader for a Qorvo DWM3001CDK FiRa TWR ranging setup: one worn
-"tag" board ranging against one or more fixed "anchor" boards.
+Background reader for a Qorvo DWM3001CDK FiRa TWR ranging setup: one fixed
+"anchor" board ranging against one or more worn "node" boards.
 
 There is no direct Python UART protocol here: ranging is started and read by
 launching `run_fira_twr.py` (vendored in `uwb/uwb-qorvo-tools/`) as a
-subprocess per board -- one for the tag (FiRa "controller" role) and one per
-anchor (FiRa "controlee" role) -- then parsing the tag's stdout with
+subprocess per board -- one for the anchor (FiRa "controller" role) and one
+per node (FiRa "controlee" role) -- then parsing the anchor's stdout with
 `RangeLogParser` for `distance: X cm` / `mac address: ...` lines.
 
-Two node modes, both driven by the same class:
+Two modes, both driven by the same class:
 
-- One anchor (`len(anchor_ports) == 1`): plain FiRa unicast TWR, exactly the
+- One node (`len(node_ports) == 1`): plain FiRa unicast TWR, exactly the
   controller/controlee pair `UWB_lab`'s lab exercise and tooling use. This
   path matches a documented, working lab flow.
-- Multiple anchors (`len(anchor_ports) > 1`): FiRa "one-to-many" ranging
-  (`--node onetomany`), where the tag is the one controller and each anchor
-  is a controlee with a distinct MAC address (`uwb-qorvo-tools`'s own
-  `--n_controlees`/`--mac`/`--dest-mac` flags). This mode is real and
-  supported by the vendored CLI/UCI stack, but it is **not** exercised by
-  `UWB_lab`'s documented lab and has not been verified against physical
-  DWM3001CDK hardware here -- smoke-test it (short `--stats` run, check that
-  every anchor's MAC shows up with `status: Ok`) before trusting it for real
-  data collection, and re-check `--slots-per-rr` if ranging looks unstable:
-  more controlees need more slots per ranging round than the single-anchor
-  default.
+- Multiple nodes (`len(node_ports) > 1`, e.g. this project's 1 anchor + 2
+  worn nodes): FiRa "one-to-many" ranging (`--node onetomany`), where the
+  anchor is the one controller and each node is a controlee with a distinct
+  MAC address (`uwb-qorvo-tools`'s own `--n_controlees`/`--mac`/`--dest-mac`
+  flags). This mode is real and supported by the vendored CLI/UCI stack, but
+  it is **not** exercised by `UWB_lab`'s documented lab and has not been
+  verified against physical DWM3001CDK hardware here -- smoke-test it (short
+  `--stats` run, check that every node's MAC shows up with `status: Ok`)
+  before trusting it for real data collection, and re-check
+  `--slots-per-rr` if ranging looks unstable: more controlees need more
+  slots per ranging round than the single-node default.
 
-Only the tag/controller side reports distance; anchor/controlee subprocesses
-just need to be running so the tag has someone to range against.
+Only the anchor/controller side reports distance; node/controlee
+subprocesses just need to be running so the anchor has someone to range
+against.
 """
 from __future__ import annotations
 
@@ -51,12 +52,12 @@ from uwb.uwb_io import (
 
 
 class UwbStream:
-    """Runs a tag+anchor(s) FiRa TWR setup and buffers parsed range samples."""
+    """Runs an anchor+node(s) FiRa TWR setup and buffers parsed range samples."""
 
     def __init__(
         self,
-        tag_port: str,
-        anchor_ports: list[str],
+        anchor_port: str,
+        node_ports: list[str],
         group_id: int,
         log_dir: Path,
         preamble_code: int = 10,
@@ -70,39 +71,39 @@ class UwbStream:
         startup_delay_s: float = 3.0,
         session_duration_s: int = 3600,
     ) -> None:
-        if not anchor_ports:
-            raise ValueError("UwbStream needs at least one anchor port.")
+        if not node_ports:
+            raise ValueError("UwbStream needs at least one node port.")
 
-        self.tag_port = tag_port
-        self.anchor_ports = list(anchor_ports)
+        self.anchor_port = anchor_port
+        self.node_ports = list(node_ports)
         self.group_id = group_id
         self.python_exe = python_exe or sys.executable
         self.ranging_span_ms = compute_ranging_span_ms(fps, ranging_span_ms)
 
-        n_anchors = len(self.anchor_ports)
-        self.multi_anchor = n_anchors > 1
+        n_nodes = len(self.node_ports)
+        self.multi_node = n_nodes > 1
         if slots_per_rr is None:
-            # Single-anchor default matches UWB_lab's documented lab exercise.
+            # Single-node default matches UWB_lab's documented lab exercise.
             # The one-to-many heuristic below has NOT been hardware-verified;
-            # tune it if ranging is unstable with more anchors.
-            slots_per_rr = 6 if not self.multi_anchor else 6 * n_anchors
+            # tune it if ranging is unstable with more nodes.
+            slots_per_rr = 6 if not self.multi_node else 6 * n_nodes
         validate_timing(slot_span, slots_per_rr, self.ranging_span_ms)
         self.slots_per_rr = slots_per_rr
 
         self.log_dir = Path(log_dir)
-        tag_dir = self.log_dir / "tag"
-        tag_dir.mkdir(parents=True, exist_ok=True)
-        anchor_dirs = []
-        for i in range(n_anchors):
-            anchor_dir = self.log_dir / f"anchor_{i}"
-            anchor_dir.mkdir(parents=True, exist_ok=True)
-            anchor_dirs.append(anchor_dir)
+        anchor_dir = self.log_dir / "anchor"
+        anchor_dir.mkdir(parents=True, exist_ok=True)
+        node_dirs = []
+        for i in range(n_nodes):
+            node_dir = self.log_dir / f"node_{i}"
+            node_dir.mkdir(parents=True, exist_ok=True)
+            node_dirs.append(node_dir)
 
         if reset_devices_first:
-            print(f"Resetting UWB devices (tag {tag_port}, anchors {self.anchor_ports})...")
+            print(f"Resetting UWB devices (anchor {anchor_port}, nodes {self.node_ports})...")
             reset_devices(
                 self.python_exe,
-                [tag_port, *self.anchor_ports],
+                [anchor_port, *self.node_ports],
                 self.log_dir / "device_reset_log.txt",
             )
 
@@ -112,22 +113,22 @@ class UwbStream:
         self._error: Exception | None = None
         self._closing = False
 
-        anchor_duration = session_duration_s + 5 + int(startup_delay_s)
-        node_mode = "onetomany" if self.multi_anchor else "unicast"
-        # Anchor MACs are 0x1..0xN; the tag stays at the CLI's own default (0x0)
-        # unless we're in one-to-many mode, where it must be set explicitly
-        # alongside --dest-mac / --n_controlees.
-        anchor_macs = [f"0x{i + 1}" for i in range(n_anchors)]
+        node_duration = session_duration_s + 5 + int(startup_delay_s)
+        node_mode = "onetomany" if self.multi_node else "unicast"
+        # Node MACs are 0x1..0xN; the anchor stays at the CLI's own default
+        # (0x0) unless we're in one-to-many mode, where it must be set
+        # explicitly alongside --dest-mac / --n_controlees.
+        node_macs = [f"0x{i + 1}" for i in range(n_nodes)]
 
-        self._anchor_procs: list[subprocess.Popen] = []
-        self._anchor_logs: list = []
-        for anchor_port, anchor_dir, anchor_mac in zip(self.anchor_ports, anchor_dirs, anchor_macs):
-            print(f"Starting UWB anchor on {anchor_port} (mac {anchor_mac})...")
-            anchor_cmd = twr_command(
+        self._node_procs: list[subprocess.Popen] = []
+        self._node_logs: list = []
+        for node_port, node_dir, node_mac in zip(self.node_ports, node_dirs, node_macs):
+            print(f"Starting UWB node on {node_port} (mac {node_mac})...")
+            node_cmd = twr_command(
                 self.python_exe,
-                anchor_port,
+                node_port,
                 preamble_code,
-                anchor_duration,
+                node_duration,
                 slot_span,
                 slots_per_rr,
                 self.ranging_span_ms,
@@ -135,28 +136,28 @@ class UwbStream:
                 controlee=True,
                 stats=True,
                 node_mode=node_mode,
-                n_controlees=n_anchors,
-                mac=anchor_mac if self.multi_anchor else None,
-                dest_mac="[0x0]" if self.multi_anchor else None,
+                n_controlees=n_nodes,
+                mac=node_mac if self.multi_node else None,
+                dest_mac="[0x0]" if self.multi_node else None,
             )
-            anchor_log = open(anchor_dir / "anchor_terminal_log.txt", "w", buffering=1)
-            anchor_proc = subprocess.Popen(
-                anchor_cmd,
-                cwd=anchor_dir,
-                stdout=anchor_log,
+            node_log = open(node_dir / "node_terminal_log.txt", "w", buffering=1)
+            node_proc = subprocess.Popen(
+                node_cmd,
+                cwd=node_dir,
+                stdout=node_log,
                 stderr=subprocess.STDOUT,
                 text=True,
                 env=process_env(),
                 start_new_session=True,
             )
-            self._anchor_procs.append(anchor_proc)
-            self._anchor_logs.append(anchor_log)
+            self._node_procs.append(node_proc)
+            self._node_logs.append(node_log)
         time.sleep(startup_delay_s)
 
-        print(f"Starting UWB tag on {tag_port}...")
-        tag_cmd = twr_command(
+        print(f"Starting UWB anchor on {anchor_port}...")
+        anchor_cmd = twr_command(
             self.python_exe,
-            tag_port,
+            anchor_port,
             preamble_code,
             session_duration_s,
             slot_span,
@@ -166,14 +167,14 @@ class UwbStream:
             controlee=False,
             stats=True,
             node_mode=node_mode,
-            n_controlees=n_anchors,
-            mac="0x0" if self.multi_anchor else None,
-            dest_mac=f"[{','.join(anchor_macs)}]" if self.multi_anchor else None,
+            n_controlees=n_nodes,
+            mac="0x0" if self.multi_node else None,
+            dest_mac=f"[{','.join(node_macs)}]" if self.multi_node else None,
         )
-        self._tag_log = open(tag_dir / "tag_terminal_log.txt", "w", buffering=1)
-        self._tag_proc = subprocess.Popen(
-            tag_cmd,
-            cwd=tag_dir,
+        self._anchor_log = open(anchor_dir / "anchor_terminal_log.txt", "w", buffering=1)
+        self._anchor_proc = subprocess.Popen(
+            anchor_cmd,
+            cwd=anchor_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -183,14 +184,14 @@ class UwbStream:
         )
 
         self._parser = RangeLogParser()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="uwb-tag-reader")
+        self._thread = threading.Thread(target=self._run, daemon=True, name="uwb-anchor-reader")
         self._thread.start()
 
     def _run(self) -> None:
         try:
-            assert self._tag_proc.stdout is not None
-            for line in self._tag_proc.stdout:
-                self._tag_log.write(line)
+            assert self._anchor_proc.stdout is not None
+            for line in self._anchor_proc.stdout:
+                self._anchor_log.write(line)
                 sample = self._parser.feed(line)
                 if sample:
                     recv_time = time.monotonic()
@@ -199,14 +200,14 @@ class UwbStream:
         except Exception as error:  # noqa: BLE001 - surfaced via check_error()
             self._error = error
         finally:
-            self._tag_log.close()
+            self._anchor_log.close()
 
     def check_error(self) -> None:
         if self._error is not None:
             raise RuntimeError(f"UWB ranging stream failed: {self._error}") from self._error
-        if not self._closing and self._tag_proc.poll() is not None:
+        if not self._closing and self._anchor_proc.poll() is not None:
             raise RuntimeError(
-                f"UWB tag process exited early with code {self._tag_proc.returncode}"
+                f"UWB anchor process exited early with code {self._anchor_proc.returncode}"
             )
 
     @property
@@ -217,8 +218,8 @@ class UwbStream:
     def window(self, start_time_s: float, end_time_s: float) -> dict[str, np.ndarray]:
         """Return samples received in [start_time_s, end_time_s] as packed arrays.
 
-        One row per (ranging round, anchor) measurement -- `mac_address` is
-        the only thing that distinguishes anchors from each other when more
+        One row per (ranging round, node) measurement -- `mac_address` is
+        the only thing that distinguishes nodes from each other when more
         than one is configured.
         """
         with self._lock:
@@ -241,17 +242,17 @@ class UwbStream:
     def close(self, final_reset: bool = True) -> None:
         self._closing = True
         self._stop_event.set()
-        stop_process(self._tag_proc)
+        stop_process(self._anchor_proc)
         self._thread.join(timeout=3)
-        for anchor_proc, anchor_log in zip(self._anchor_procs, self._anchor_logs):
-            stop_process(anchor_proc, anchor_log)
+        for node_proc, node_log in zip(self._node_procs, self._node_logs):
+            stop_process(node_proc, node_log)
 
         if final_reset:
             print("Resetting UWB devices after stream close...")
             try:
                 reset_devices(
                     self.python_exe,
-                    [self.tag_port, *self.anchor_ports],
+                    [self.anchor_port, *self.node_ports],
                     self.log_dir / "final_device_reset_log.txt",
                 )
             except RuntimeError as error:
