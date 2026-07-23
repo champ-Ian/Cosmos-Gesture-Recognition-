@@ -86,9 +86,11 @@ class UwbReader(BaseReader):
         self.multi_node = n_nodes > 1
         if slots_per_rr is None:
             # Single-node default matches UWB_lab's documented lab exercise.
-            # The one-to-many heuristic below has NOT been hardware-verified;
-            # tune it if ranging is unstable with more nodes.
-            slots_per_rr = 6 if not self.multi_node else 6 * n_nodes
+            # Multi-node minimum (>= 8 for anchor + 2 controlees) per TA
+            # guidance -- still worth smoke-testing before trusting it, since
+            # this project's own 2-node hardware turned out to have a
+            # defective controlee independent of slot timing.
+            slots_per_rr = 6 if not self.multi_node else max(8, 6 * n_nodes)
         validate_timing(slot_span, slots_per_rr, self.ranging_span_ms)
         self.slots_per_rr = slots_per_rr
 
