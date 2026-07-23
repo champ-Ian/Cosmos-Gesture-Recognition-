@@ -226,6 +226,100 @@ never shows `Ok`, try increasing `--uwb-slots-per-rr` first.
 Per-board logs and device-reset logs are written under
 `data/raw/<session>/uwb_logs/`.
 
+## Step-by-step: getting each sensor ready to collect
+
+Do this once per sensor, in order, before starting a real session. Only pass
+the flag for a sensor once you've actually plugged it in — `collect.py`
+skips any sensor whose port/flag is omitted, which is also how you build a
+single-sensor baseline.
+
+**mmWave radar**
+1. Plug the xWRL6432 EVM in over its USB-to-UART adapter.
+2. Find the port: `ls /dev/cu.usbserial*` (macOS) / Device Manager (Windows).
+3. If it was used in a previous run this session, power-cycle the EVM first
+   — it won't accept a new config otherwise.
+4. Pass `--mmwave-port <port>` (and `--mmwave-cfg <path>` if you want a
+   config other than the default `near_field_hand_50cm.cfg`).
+
+**IMU**
+1. Plug in the ESP32 Core2 running the `IMU_lab_students` firmware over
+   Type-C.
+2. Find the port: `ls /dev/cu.usbserial*` or
+   `python -m serial.tools.list_ports -v`.
+3. Pass `--imu-port <port>` (`--imu-baud` only if your firmware isn't at the
+   default 115200).
+
+**UWB**
+1. Plug in the anchor board and every node board over micro-USB — each gets
+   its own port.
+2. Find each port: `ls /dev/cu.usbmodem*`.
+3. Confirm your group's class-sheet-assigned preamble code and channel —
+   every board in the setup must match.
+4. Pass `--uwb-anchor-port <port>`, one `--uwb-node-port <port>` per node,
+   `--uwb-group-id`, `--uwb-preamble-code`, and `--uwb-channel`.
+
+**RFID**
+1. Power on the RFID reader and connect your laptop to its network.
+2. Confirm it's reachable at `192.168.137.1:9055` (the default — override
+   with `--rfid-host`/`--rfid-tcp-port` if your reader is set up
+   differently).
+3. Pass `--rfid` to enable it.
+
+## Verifying a sensor is actually collecting data
+
+Do this per sensor — one at a time — before trusting it in a real
+multi-sensor session. Run a throwaway 1-trial, short-duration session with
+only that sensor's flag set:
+
+```bash
+python src/collect.py --collector smoketest --mmwave-port /dev/cu.usbserial-AAAA \
+  --gesture pull --trials 1 --duration 3 --auto-accept
+```
+
+**While it's recording**, watch the console. After the trial window closes,
+`collect.py` prints a line like:
+
+```text
+Captured trial: mmwave=142f
+```
+
+(`imu=NNNL`, `uwb=NNNsamples`, `rfid=NNNL` for the other sensors — one entry
+per enabled sensor.) If the count for your sensor is `0`, it's not actually
+streaming — stop and check wiring/port before collecting anything real. A
+nonzero, steadily-growing count across a couple of test trials is the
+live-signal check; the file checks below are the after-the-fact check on the
+same session.
+
+Then confirm the written file backs that up, in
+`data/raw/session_smoketest_.../`:
+
+- **mmWave** — `mmwave.npz` should have a nonzero frame count:
+  ```bash
+  python -c "import numpy as np; d = np.load('data/raw/session_smoketest_.../mmwave.npz'); print(d['frame_number'].shape)"
+  ```
+- **IMU** — `imu.csv` should have more than just the header row, with
+  non-placeholder `ax..gz` values:
+  ```bash
+  wc -l data/raw/session_smoketest_.../imu.csv
+  tail -5 data/raw/session_smoketest_.../imu.csv
+  ```
+- **UWB** — `uwb.csv` should have rows with `status=Ok` and a real
+  `distance_cm`; if it's empty, check the anchor's own log:
+  ```bash
+  tail -5 data/raw/session_smoketest_.../uwb.csv
+  grep "status: Ok" data/raw/session_smoketest_.../uwb_logs/anchor/anchor_terminal_log.txt
+  ```
+- **RFID** — `rfid.csv` should have rows with a real `epc` value (hold a
+  tag near the reader during the trial so there's something to read):
+  ```bash
+  tail -5 data/raw/session_smoketest_.../rfid.csv
+  ```
+
+If a sensor comes back empty, see [Troubleshooting](#troubleshooting) below
+for that sensor's specific failure modes before re-running the smoke test.
+Once every sensor you plan to use passes this check individually, combine
+their flags into one real collection session.
+
 ## Collecting data
 
 Only pass `--*-port` (and `--rfid`) for sensors you actually have wired up
