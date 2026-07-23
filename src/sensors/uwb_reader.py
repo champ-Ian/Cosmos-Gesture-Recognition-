@@ -117,9 +117,12 @@ class UwbReader(BaseReader):
 
         node_duration = session_duration_s + 5 + int(startup_delay_s)
         node_mode = "onetomany" if self.multi_node else "unicast"
-        # Node MACs are 0x1..0xN; the anchor stays at the CLI's own default
-        # (0x0) unless we're in one-to-many mode, where it must be set
-        # explicitly alongside --dest-mac / --n_controlees.
+        # Node MACs are 0x1..0xN. In one-to-many mode only the controller needs
+        # --dest-mac (the list of controlee MACs); controlees just need --mac,
+        # per the vendored CLI's own documented one-to-many example
+        # (uwb-qorvo-tools/scripts/fira/run_fira_twr/README.md) -- passing
+        # --dest-mac on the controlee side too caused every ranging round to
+        # time out (RangingRxTimeout on both MACs, every round).
         node_macs = [f"0x{i + 1}" for i in range(n_nodes)]
 
         self._node_procs: list[subprocess.Popen] = []
@@ -140,7 +143,6 @@ class UwbReader(BaseReader):
                 node_mode=node_mode,
                 n_controlees=n_nodes,
                 mac=node_mac if self.multi_node else None,
-                dest_mac="[0x0]" if self.multi_node else None,
             )
             node_log = open(node_dir / "node_terminal_log.txt", "w", buffering=1)
             node_proc = subprocess.Popen(
