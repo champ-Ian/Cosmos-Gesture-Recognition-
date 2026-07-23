@@ -150,9 +150,11 @@ def parse_args() -> argparse.Namespace:
         "--uwb-node-port",
         action="append",
         help=(
-            "UWB node (worn, FiRa controlee) serial port. Repeat for multiple nodes -- this "
-            "project's kit is 1 anchor + 2 nodes. NOTE: the multi-node one-to-many path is "
-            "unverified against real DWM3001CDK hardware -- smoke-test it first."
+            "UWB node (worn, FiRa controlee) serial port. Repeat for multiple nodes. "
+            "This kit's 2nd node board turned out to be defective (confirmed via swap-testing "
+            "against the anchor), so this project runs 1 anchor + 1 node -- plain unicast, "
+            "not the multi-node one-to-many path, which remains unverified against real "
+            "DWM3001CDK hardware if you ever do have a working 2nd/3rd node."
         ),
     )
     uwb_group.add_argument(
