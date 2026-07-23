@@ -190,8 +190,23 @@ def parse_args() -> argparse.Namespace:
         "--rfid-host", default="192.168.137.1", help="RFID reader network address (see RFID_Lab)."
     )
     rfid_group.add_argument("--rfid-tcp-port", type=int, default=9055, help="RFID reader TCP port.")
+    rfid_group.add_argument(
+        "--rfid-epcs",
+        nargs="+",
+        default=None,
+        help=(
+            "Only keep reads from these EPCs (your group's own tags), same idea as "
+            "RFID_Lab's --epcs/SELECTED_EPCS filter. Reads from any other EPC (e.g. another "
+            "group's tags in range) are discarded before they're written to rfid.csv or "
+            "counted toward --min-sensor-lines."
+        ),
+    )
 
     return parser.parse_args()
+
+
+def normalize_epcs(epcs: list[str] | None) -> set[str] | None:
+    return {epc.upper() for epc in epcs} if epcs else None
 
 
 def prompt_ready(gesture_name: str, trial_index: int, trials: int, duration_s: float, is_periodic: bool) -> None:
@@ -326,10 +341,17 @@ class SessionLogger:
     reader's buffer into its own per-session log (imu.csv/uwb.csv/rfid.csv),
     tagged with time_s relative to the fixed session start."""
 
-    def __init__(self, session_dir: Path, sensors: SensorSet, session_start: float) -> None:
+    def __init__(
+        self,
+        session_dir: Path,
+        sensors: SensorSet,
+        session_start: float,
+        rfid_epcs: set[str] | None = None,
+    ) -> None:
         self.session_dir = session_dir
         self.sensors = sensors
         self.session_start = session_start
+        self.rfid_epcs = rfid_epcs
         self._written = {"imu": 0, "uwb": 0, "rfid": 0}
         self._csv_files: dict[str, tuple] = {}
 
@@ -434,6 +456,8 @@ class SessionLogger:
         _, writer = self._csv_files["rfid"]
         for rel_t, line in new_lines:
             parsed = parse_rfid_line(line)
+            if parsed is not None and self.rfid_epcs is not None and parsed[0].upper() not in self.rfid_epcs:
+                continue  # another tag's read (e.g. a different group's) -- not ours, drop it
             epc, rssi, read_count = parsed if parsed is not None else ("", "", "")
             writer.writerow(
                 {
@@ -496,7 +520,13 @@ def capture_window(sensors: SensorSet, logger: SessionLogger, duration_s: float)
     return start, time.monotonic()
 
 
-def trial_ok(sensors: SensorSet, args: argparse.Namespace, trial_start: float, trial_end: float) -> str | None:
+def trial_ok(
+    sensors: SensorSet,
+    args: argparse.Namespace,
+    trial_start: float,
+    trial_end: float,
+    rfid_epcs: set[str] | None = None,
+) -> str | None:
     """Live per-trial quality check (independent of the continuous logs) -- returns
     None if the trial meets minimum-sample thresholds, else a reason string."""
     if sensors.mmwave is not None:
@@ -514,8 +544,14 @@ def trial_ok(sensors: SensorSet, args: argparse.Namespace, trial_start: float, t
             return f"only {ok_count} Ok UWB range samples (need {args.min_uwb_samples})"
     if sensors.rfid is not None:
         rfid_lines = sensors.rfid.window(trial_start, trial_end)
+        if rfid_epcs is not None:
+            rfid_lines = [
+                (rel_t, line)
+                for rel_t, line in rfid_lines
+                if (parsed := parse_rfid_line(line)) is not None and parsed[0].upper() in rfid_epcs
+            ]
         if len(rfid_lines) < args.min_sensor_lines:
-            return f"only {len(rfid_lines)} RFID lines (need {args.min_sensor_lines})"
+            return f"only {len(rfid_lines)} matching RFID lines (need {args.min_sensor_lines})"
     return None
 
 
@@ -541,6 +577,7 @@ def make_session_metadata(args: argparse.Namespace, gesture_list: list[str], sen
             "uwb_nodes": args.uwb_node_port,
             "rfid": f"{args.rfid_host}:{args.rfid_tcp_port}" if args.rfid else None,
         },
+        "rfid_epcs": sorted(normalize_epcs(args.rfid_epcs)) if sensors.rfid is not None and args.rfid_epcs else None,
         "uwb_config": (
             {
                 "group_id": args.uwb_group_id,
@@ -571,8 +608,11 @@ def main() -> int:
     session_dir.mkdir(parents=True, exist_ok=True)
 
     sensors = SensorSet(args)
+    rfid_epcs = normalize_epcs(args.rfid_epcs)
+    if rfid_epcs is not None:
+        print(f"RFID EPC filter active -- keeping only: {', '.join(sorted(rfid_epcs))}")
     session_start = time.monotonic()
-    logger = SessionLogger(session_dir, sensors, session_start)
+    logger = SessionLogger(session_dir, sensors, session_start, rfid_epcs=rfid_epcs)
     logger.write_event("session_start", "", "", args.collector, now=session_start)
 
     write_json(session_dir / "session_metadata.json", make_session_metadata(args, gesture_list, sensors))
@@ -603,7 +643,7 @@ def main() -> int:
                     logger.write_event("trial_end", trial_id, gesture, args.collector, now=trial_end)
                     logger.drain(trial_end)
 
-                    reject_reason = trial_ok(sensors, args, trial_start, trial_end)
+                    reject_reason = trial_ok(sensors, args, trial_start, trial_end, rfid_epcs=rfid_epcs)
                     if reject_reason is not None:
                         print(f"Discarded: {reject_reason}.")
                         logger.write_event("trial_reject", trial_id, gesture, args.collector)

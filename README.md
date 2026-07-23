@@ -173,6 +173,13 @@ feature vector by default; if your gestures use specific tags (e.g.
 Soli-style one-tag-per-finger sensing), filter by EPC first for per-tag
 features instead.
 
+If other groups' tags are within read range (common when several teams share
+a room), pass `--rfid-epcs EPC_TAG_1 EPC_TAG_2 EPC_TAG_3` with your own three
+EPCs -- same idea as `RFID_Lab`'s `--epcs`/`SELECTED_EPCS` filter. Reads from
+any EPC not in that list are dropped before they reach `rfid.csv` or count
+toward `--min-sensor-lines`, so a stray neighboring tag can't pad your trial
+or pollute `extract_rfid_features()`'s pooled stats downstream.
+
 ### UWB wiring (Qorvo DWM3001CDK FiRa ranging: anchor + node(s))
 
 Like RFID, the UWB kit is not read over generic serial text: it's the same
