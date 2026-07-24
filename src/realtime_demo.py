@@ -70,7 +70,10 @@ def parse_args() -> argparse.Namespace:
     imu_group.add_argument("--imu-port")
     imu_group.add_argument("--imu-baud", type=int, default=115200)
 
-    uwb_group = parser.add_argument_group("UWB (Qorvo DWM3001CDK FiRa TWR: anchor + node(s))")
+    uwb_group = parser.add_argument_group(
+        "UWB (Qorvo DWM3001CDK FiRa TWR: 2 boards, one worn per wrist -- wrist-to-wrist "
+        "distance, no fixed anchor)"
+    )
     uwb_group.add_argument("--uwb-anchor-port")
     uwb_group.add_argument("--uwb-node-port", action="append")
     uwb_group.add_argument("--uwb-group-id", type=int)

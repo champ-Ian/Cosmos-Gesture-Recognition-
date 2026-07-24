@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
 """
-Background reader for a Qorvo DWM3001CDK FiRa TWR ranging setup: one fixed
-"anchor" board ranging against one or more worn "node" boards.
+Background reader for a Qorvo DWM3001CDK FiRa TWR ranging setup.
+
+The class/parameter names below still say "anchor" and "node" -- that's just
+the FiRa role naming (controller vs. controlee) carried over from an earlier
+version of this project's hardware plan (1 fixed anchor + worn nodes). After
+one board in the original 3-board kit was confirmed defective via
+swap-testing, this project settled on 2 boards total, **both worn, one per
+wrist** -- there is no fixed anchor. `distance_cm` is a wrist-to-wrist
+distance, not a distance-to-a-fixed-point.
 
 There is no direct Python UART protocol here: ranging is started and read by
 launching `run_fira_twr.py` (vendored in `uwb/uwb-qorvo-tools/`) as a
-subprocess per board -- one for the anchor (FiRa "controller" role) and one
-per node (FiRa "controlee" role) -- then parsing the anchor's stdout with
+subprocess per board -- one per board, one playing the FiRa "controller" role
+(still called "anchor" in code/flags) and one the "controlee" role (still
+called "node") -- then parsing the controller side's stdout with
 `RangeLogParser` for `distance: X cm` / `mac address: ...` lines.
 
 Two modes, both driven by the same class:
 
-- One node (`len(node_ports) == 1`): plain FiRa unicast TWR, exactly the
-  controller/controlee pair `UWB_lab`'s lab exercise and tooling use. This
-  path matches a documented, working lab flow.
-- Multiple nodes (`len(node_ports) > 1`, e.g. this project's 1 anchor + 2
-  worn nodes): FiRa "one-to-many" ranging (`--node onetomany`), where the
-  anchor is the one controller and each node is a controlee with a distinct
-  MAC address (`uwb-qorvo-tools`'s own `--n_controlees`/`--mac`/`--dest-mac`
-  flags). This mode is real and supported by the vendored CLI/UCI stack, but
-  it is **not** exercised by `UWB_lab`'s documented lab and has not been
-  verified against physical DWM3001CDK hardware here -- smoke-test it (short
-  `--stats` run, check that every node's MAC shows up with `status: Ok`)
-  before trusting it for real data collection, and re-check
-  `--slots-per-rr` if ranging looks unstable: more controlees need more
-  slots per ranging round than the single-node default.
+- One node (`len(node_ports) == 1`, this project's current setup): plain
+  FiRa unicast TWR, exactly the controller/controlee pair `UWB_lab`'s lab
+  exercise and tooling use (that lab's own "Bimanual Activity Recognition"
+  section is this exact wrist-to-wrist topology). This path matches a
+  documented, working lab flow.
+- Multiple nodes (`len(node_ports) > 1`): FiRa "one-to-many" ranging
+  (`--node onetomany`), where the controller-role board ranges against
+  several controlee-role boards, each with a distinct MAC address
+  (`uwb-qorvo-tools`'s own `--n_controlees`/`--mac`/`--dest-mac` flags). This
+  mode is real and supported by the vendored CLI/UCI stack, but it is **not**
+  exercised by `UWB_lab`'s documented lab and has not been verified against
+  physical DWM3001CDK hardware here -- smoke-test it (short `--stats` run,
+  check that every node's MAC shows up with `status: Ok`) before trusting it
+  for real data collection, and re-check `--slots-per-rr` if ranging looks
+  unstable: more controlees need more slots per ranging round than the
+  single-node default.
 
-Only the anchor/controller side reports distance; node/controlee
-subprocesses just need to be running so the anchor has someone to range
-against.
+Only the controller-role ("anchor") side reports distance; the controlee
+("node") subprocess just needs to be running so the controller has someone
+to range against.
 """
 from __future__ import annotations
 

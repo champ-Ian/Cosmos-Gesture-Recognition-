@@ -43,7 +43,7 @@ gestures in one session):
         --mmwave-port /dev/cu.usbserial-XXXX \\
         --imu-port /dev/cu.usbserial-YYYY \\
         --uwb-anchor-port /dev/cu.usbmodemZZZZ \\
-        --uwb-node-port /dev/cu.usbmodemWWWW --uwb-node-port /dev/cu.usbmodemVVVV \\
+        --uwb-node-port /dev/cu.usbmodemWWWW \\
         --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
         --rfid \\
         --gesture pull,push,clapping \\
@@ -144,17 +144,28 @@ def parse_args() -> argparse.Namespace:
     imu_group.add_argument("--imu-port", help="IMU serial port.")
     imu_group.add_argument("--imu-baud", type=int, default=115200)
 
-    uwb_group = parser.add_argument_group("UWB (Qorvo DWM3001CDK FiRa TWR: anchor + node(s))")
-    uwb_group.add_argument("--uwb-anchor-port", help="UWB anchor (fixed, FiRa controller) serial port.")
+    uwb_group = parser.add_argument_group(
+        "UWB (Qorvo DWM3001CDK FiRa TWR: 2 boards, one worn per wrist -- wrist-to-wrist "
+        "distance, no fixed anchor)"
+    )
+    uwb_group.add_argument(
+        "--uwb-anchor-port",
+        help=(
+            "UWB board 1 (worn on one wrist, FiRa controller role). Despite the flag name "
+            "-- kept for FiRa-role consistency with the rest of the code -- neither board "
+            "is physically fixed in this project's setup; it's wrist-to-wrist ranging."
+        ),
+    )
     uwb_group.add_argument(
         "--uwb-node-port",
         action="append",
         help=(
-            "UWB node (worn, FiRa controlee) serial port. Repeat for multiple nodes. "
-            "This kit's 2nd node board turned out to be defective (confirmed via swap-testing "
-            "against the anchor), so this project runs 1 anchor + 1 node -- plain unicast, "
-            "not the multi-node one-to-many path, which remains unverified against real "
-            "DWM3001CDK hardware if you ever do have a working 2nd/3rd node."
+            "UWB board 2 (worn on the other wrist, FiRa controlee role). This kit's 3rd "
+            "board turned out to be defective (confirmed via swap-testing), and the setup "
+            "was later revamped from 1 fixed anchor + worn node(s) to 2 worn boards (one "
+            "per wrist, wrist-to-wrist distance) -- so this project runs exactly 1 "
+            "anchor-role + 1 node-role board, plain unicast. Repeat this flag for the "
+            "(unverified) multi-node one-to-many path if you ever have 2+ working nodes."
         ),
     )
     uwb_group.add_argument(

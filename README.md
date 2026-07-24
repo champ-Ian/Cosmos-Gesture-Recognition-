@@ -69,7 +69,7 @@ you `cd src/` first and drop the `src/` prefix instead.
 | --- | --- |
 | mmWave radar (TI xWRL6432/IWR6432, from `mmwave_lab`) | Range profile + point cloud of arm/hand motion. |
 | IMU (ESP32 Core2 + BMI270, from `IMU_lab_students`) | Wrist/hand-worn accelerometer + gyroscope. |
-| UWB (3x Qorvo DWM3001CDK, from `UWB_lab`) | FiRa two-way-ranging distance from 1 fixed anchor to 2 worn nodes (one per wrist/arm). |
+| UWB (2x Qorvo DWM3001CDK, from `UWB_lab`) | FiRa two-way-ranging **wrist-to-wrist** distance -- one board worn per wrist, no fixed anchor (the kit's 3rd board was confirmed defective via swap-testing and dropped). |
 | RFID reader + tags (from `RFID_Lab`) | Near-field hand/finger sensing (Soli-style micro-gestures, fist open/close). |
 
 Not every gesture needs every sensor — see `gestures.py` for the
@@ -180,55 +180,78 @@ any EPC not in that list are dropped before they reach `rfid.csv` or count
 toward `--min-sensor-lines`, so a stray neighboring tag can't pad your trial
 or pollute `extract_rfid_features()`'s pooled stats downstream.
 
-### UWB wiring (Qorvo DWM3001CDK FiRa ranging: anchor + node(s))
+### UWB wiring (Qorvo DWM3001CDK FiRa ranging: 2 boards, one worn per wrist)
 
 Like RFID, the UWB kit is not read over generic serial text: it's the same
-Qorvo DWM3001CDK boards as `UWB_lab`, running FiRa two-way ranging (TWR)
-between one fixed **anchor** (FiRa "controller" role) and one or more worn
-**nodes** (FiRa "controlee" role) — this project's kit is 1 anchor + 2 nodes
-(e.g. one node per wrist/arm), so each gesture gets two independent
-distance-from-anchor signals instead of one. Each board needs its own serial
-port (`ls /dev/cu.usbmodem*` on macOS), and every board in the setup must use
-the same class-sheet-assigned preamble code and channel.
+Qorvo DWM3001CDK boards as `UWB_lab`, running FiRa two-way ranging (TWR).
+**This kit came with 3 boards; one was confirmed defective by swap-testing**
+(it failed ranging paired with either of the other two, while those two
+paired with each other successfully), so this project runs the remaining
+**2 boards, one worn per wrist** — there is no fixed anchor anymore, and
+`distance_cm` is a **wrist-to-wrist** distance. This is exactly `UWB_lab`'s
+own "Bimanual Activity Recognition" section 10 topology (one controller, one
+controlee, both worn), not the original 1-fixed-anchor-plus-worn-nodes plan.
+
+The code and CLI flags still say `--uwb-anchor-port`/`--uwb-node-port` and
+"anchor"/"node" throughout — that naming is kept for the FiRa role each board
+plays (controller vs. controlee), which is unrelated to whether either board
+is physically fixed. Don't read "anchor" as "stationary" anywhere in this
+codebase; both boards are worn. Each board needs its own serial port
+(`ls /dev/cu.usbmodem*` on macOS), and both boards must use the same
+class-sheet-assigned preamble code and channel (if you still have one
+assigned; otherwise any matching pair works, see the UWB troubleshooting
+thread for why the class sheet no longer strictly applies once you're not
+sharing airspace with other groups).
 
 `src/sensors/uwb_reader.py` drives this the same way
 `UWB_lab/ranging_experiment_wrapper.py` does: it launches the vendored
 `src/uwb/uwb-qorvo-tools/scripts/fira/run_fira_twr/run_fira_twr.py` as a
 subprocess per board (resetting all devices first via UCI), then parses the
-anchor's `distance: X cm` / `status: Ok (0x0)` / `mac address: ...` stdout
-lines with a regex-based log parser. Only the anchor reports distance;
-nodes just need to be running so the anchor has something to range against.
+controller-role ("anchor") board's `distance: X cm` / `status: Ok (0x0)` /
+`mac address: ...` stdout lines with a regex-based log parser. Only that side
+reports distance; the controlee ("node") subprocess just needs to be running
+so the controller has something to range against.
 
 Required flags when UWB is enabled:
 
 ```text
---uwb-anchor-port /dev/cu.usbmodemXXXX
---uwb-node-port /dev/cu.usbmodemYYYY   # repeat --uwb-node-port for more nodes
---uwb-group-id <class-sheet group number>
---uwb-preamble-code <9|10|11|12, from the class sheet>
---uwb-channel <5|9, from the class sheet>
+--uwb-anchor-port /dev/cu.usbmodemXXXX   # board 1, worn on one wrist
+--uwb-node-port /dev/cu.usbmodemYYYY     # board 2, worn on the other wrist
+--uwb-group-id <any number -- see note below>
+--uwb-preamble-code <9|10|11|12, from the class sheet if you still have one>
+--uwb-channel <5|9, from the class sheet if you still have one>
 ```
+
+`--uwb-group-id` is pure bookkeeping written into `session_metadata.json` —
+it has no effect on the actual ranging (`twr_command()` never receives it),
+so if the class sheet coordinating preamble/channel across groups no longer
+applies to you, any number is fine.
 
 `--uwb-fps` (default 50), `--uwb-slot-span` (default 2400), and
 `--uwb-slots-per-rr` control the ranging timing.
 
-**Single node** (one `--uwb-node-port`): plain FiRa unicast TWR, exactly
-`UWB_lab`'s documented controller/controlee lab exercise — `--uwb-slots-per-rr`
-defaults to 6, same as that lab.
+**Single node** (one `--uwb-node-port`, this project's current setup): plain
+FiRa unicast TWR, exactly `UWB_lab`'s documented controller/controlee lab
+exercise — `--uwb-slots-per-rr` defaults to 6, same as that lab, and the
+default `--uwb-fps 50` works out of the box (no override needed).
 
-**Multiple nodes** (two or more `--uwb-node-port` flags, i.e. this project's
-1 anchor + 2 nodes): the anchor ranges against all nodes using FiRa
-"one-to-many" mode (`uwb-qorvo-tools`'s own
-`--node`/`--n_controlees`/`--mac`/`--dest-mac` flags), with each node
-assigned a distinct MAC address and every sample tagged with which node's
-MAC it came from (`uwb_mac_address` in the cut trial `.npz`, see below).
-**This path is not exercised by `UWB_lab`'s documented lab and has not been
-verified against physical DWM3001CDK hardware** — `--uwb-slots-per-rr`
-defaults to a heuristic (`6 * node count`) that may need tuning. Before
-trusting it for real data collection, run a short (`--trials 1 --duration 3`)
-smoke test and check `data/raw/<session>/uwb_logs/anchor/anchor_terminal_log.txt`
-for `status: Ok` against every node's MAC — if ranging is unstable or a node
-never shows `Ok`, try increasing `--uwb-slots-per-rr` first.
+**Multiple nodes** (two or more `--uwb-node-port` flags): one controller-role
+board ranges against all controlee-role boards using FiRa "one-to-many" mode
+(`uwb-qorvo-tools`'s own `--node`/`--n_controlees`/`--mac`/`--dest-mac`
+flags), with each node assigned a distinct MAC address and every sample
+tagged with which node's MAC it came from (`uwb_mac_address` in the cut trial
+`.npz`, see below). **This path is not exercised by `UWB_lab`'s documented
+lab and has not been verified against physical DWM3001CDK hardware** —
+`--uwb-slots-per-rr` defaults to a heuristic (`max(8, 6 * node count)`, the
+`8` floor per TA guidance for 2 controlees) that may still need tuning.
+Before trusting it for real data collection, run a short
+(`--trials 1 --duration 3`) smoke test and check
+`data/raw/<session>/uwb_logs/anchor/anchor_terminal_log.txt` for `status: Ok`
+against every node's MAC — if ranging is unstable or a node never shows
+`Ok`, try increasing `--uwb-slots-per-rr` first, and if that doesn't help,
+suspect a specific board rather than the config (swap-test it against a
+board you know works, the same way this project found its defective 3rd
+board).
 
 Per-board logs and device-reset logs are written under
 `data/raw/<session>/uwb_logs/`.
@@ -257,13 +280,14 @@ single-sensor baseline.
    default 115200).
 
 **UWB**
-1. Plug in the anchor board and every node board over micro-USB — each gets
-   its own port.
+1. Plug in both boards over micro-USB — each gets its own port. Wear one on
+   each wrist (no board is a fixed anchor in this project's setup).
 2. Find each port: `ls /dev/cu.usbmodem*`.
-3. Confirm your group's class-sheet-assigned preamble code and channel —
-   every board in the setup must match.
-4. Pass `--uwb-anchor-port <port>`, one `--uwb-node-port <port>` per node,
-   `--uwb-group-id`, `--uwb-preamble-code`, and `--uwb-channel`.
+3. If you still have a class-sheet-assigned preamble code/channel, confirm
+   both boards match it; otherwise any matching pair works for both.
+4. Pass `--uwb-anchor-port <port>` for one wrist's board, `--uwb-node-port
+   <port>` for the other, plus `--uwb-group-id` (any number — it's just a
+   metadata label, see the UWB wiring section above).
 
 **RFID**
 1. Power on the RFID reader and connect your laptop to its network.
@@ -349,7 +373,7 @@ python src/collect.py \
   --mmwave-port /dev/cu.usbserial-AAAA \
   --imu-port /dev/cu.usbserial-BBBB \
   --uwb-anchor-port /dev/cu.usbmodemCCCC \
-  --uwb-node-port /dev/cu.usbmodemDDDD --uwb-node-port /dev/cu.usbmodemEEEE \
+  --uwb-node-port /dev/cu.usbmodemDDDD \
   --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \
   --rfid \
   --gesture pull,push,clapping \
@@ -550,15 +574,23 @@ and are saved to `sessions/eval_<name>/realtime_predictions.csv`.
   reader's network and reachable at `--rfid-host`:`--rfid-tcp-port` (default
   `192.168.137.1:9055`) -- it's a TCP device, not a serial port, so a wrong
   port number here means "wrong network," not "wrong `/dev/...` path."
-- If UWB produces zero Ok samples: confirm all boards are on the
-  class-sheet-assigned preamble code/channel, that no other terminal/process
-  already has any port open, and check
-  `data/raw/<session>/uwb_logs/anchor/anchor_terminal_log.txt` for the
-  raw `run_fira_twr.py` output. Use `--uwb-skip-device-reset` only if the
-  boards are already known-good — a bad reset is a common cause of a silent
-  anchor. With multiple nodes, if only some nodes' MACs ever show
-  `status: Ok`, try raising `--uwb-slots-per-rr` first (see the UWB wiring
-  section above).
+- If UWB produces zero Ok samples: confirm both boards are on the same
+  preamble code/channel, that no other terminal/process already has any port
+  open (`lsof <port>`, kill stray `run_fira_twr.py` processes from earlier
+  manual testing), and check
+  `data/raw/<session>/uwb_logs/anchor/anchor_terminal_log.txt` for the raw
+  `run_fira_twr.py` output — a *deterministic* `RangingRxTimeout` on every
+  single round (same slot number every time) is a config/hardware mismatch,
+  not RF noise, which would look intermittent instead. If it persists even
+  in the simplest possible plain 2-board unicast test with no config
+  overrides, suspect a specific board rather than the config — swap-test it
+  against a board you know works (pair it with a confirmed-good board; if
+  that also fails, the common board is the suspect). That's exactly how this
+  project found and dropped its 3rd, defective board. Use
+  `--uwb-skip-device-reset` only if the boards are already known-good — a
+  bad reset is a common cause of a silent controller ("anchor"). With
+  multiple nodes, if only some nodes' MACs ever show `status: Ok`, try
+  raising `--uwb-slots-per-rr` first (see the UWB wiring section above).
 - `Ctrl+C` stops the collector cleanly during a trial recording; it sends
   `sensorStop 0` to the radar, resets the UWB boards, and closes all serial
   ports/subprocesses before exiting. Whatever was already logged up to that

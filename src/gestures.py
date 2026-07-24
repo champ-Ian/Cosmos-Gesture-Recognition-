@@ -28,8 +28,9 @@ class GestureSpec:
 
 
 # Suggested sensor combination per gesture, based on the group's sensing plan:
-# mmwave = radar range/point-cloud, imu = ESP32 Core2 IMU, uwb = the 3 UWB
-# ranging modules, rfid = RFID reader + tag/copper-wire near-field sensing.
+# mmwave = radar range/point-cloud, imu = ESP32 Core2 IMU, uwb = the 2 worn
+# UWB boards (one per wrist, no fixed anchor -- distance is wrist-to-wrist),
+# rfid = RFID reader + tag/copper-wire near-field sensing.
 GESTURES: dict[str, GestureSpec] = {
     spec.name: spec
     for spec in (
@@ -79,7 +80,8 @@ GESTURES: dict[str, GestureSpec] = {
             "one_arm_boxing",
             "One-Arm Boxing",
             "Throw repeated punches forward with one arm, retracting between each. IMU on the "
-            "punching wrist, UWB tag tracks distance change to the anchor.",
+            "punching wrist; both wrists wear a UWB board, so UWB tracks the "
+            "wrist-to-wrist distance change with each punch.",
             ("imu", "uwb"),
             group="periodic",
         ),
@@ -93,7 +95,8 @@ GESTURES: dict[str, GestureSpec] = {
         GestureSpec(
             "two_arm_boxing",
             "Two-Arm Boxing",
-            "Throw alternating punches with both arms; UWB distance-to-anchor should change with each punch.",
+            "Throw alternating punches with both arms; with a UWB board worn on each wrist, "
+            "the wrist-to-wrist distance should change with each punch.",
             ("imu", "uwb"),
             group="periodic",
         ),
