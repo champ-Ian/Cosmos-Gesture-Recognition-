@@ -535,8 +535,8 @@ def _cut_one_trial(
         "uwb_sample_count": uwb_sample_count,
         "uwb_ok_sample_count": uwb_ok_count,
         "rfid_line_count": rfid_line_count,
-        "npz_path": str(npz_path),
-        "session_dir": str(trial_out_dir),
+        "npz_path": str(npz_path.resolve()),
+        "session_dir": str(trial_out_dir.resolve()),
         "started_at": "",
         "finished_at": "",
     }
