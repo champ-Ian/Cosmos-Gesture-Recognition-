@@ -125,7 +125,11 @@ def parse_args() -> argparse.Namespace:
         "--min-sensor-lines",
         type=int,
         default=5,
-        help="Minimum raw lines required per enabled IMU/RFID sensor to keep a trial.",
+        help=(
+            "Minimum raw IMU lines required to keep a trial. RFID is exempt -- most "
+            "gestures don't involve the reader, so zero RFID reads never discards a trial "
+            "on its own; whatever RFID lines do come in are still logged either way."
+        ),
     )
     parser.add_argument(
         "--min-uwb-samples",
@@ -538,7 +542,6 @@ def trial_ok(
     args: argparse.Namespace,
     trial_start: float,
     trial_end: float,
-    rfid_epcs: set[str] | None = None,
 ) -> str | None:
     """Live per-trial quality check (independent of the continuous logs) -- returns
     None if the trial meets minimum-sample thresholds, else a reason string."""
@@ -555,16 +558,11 @@ def trial_ok(
         ok_count = int(np.count_nonzero(uwb_window["status"] == "Ok"))
         if ok_count < args.min_uwb_samples:
             return f"only {ok_count} Ok UWB range samples (need {args.min_uwb_samples})"
-    if sensors.rfid is not None:
-        rfid_lines = sensors.rfid.window(trial_start, trial_end)
-        if rfid_epcs is not None:
-            rfid_lines = [
-                (rel_t, line)
-                for rel_t, line in rfid_lines
-                if (parsed := parse_rfid_line(line)) is not None and parsed[0].upper() in rfid_epcs
-            ]
-        if len(rfid_lines) < args.min_sensor_lines:
-            return f"only {len(rfid_lines)} matching RFID lines (need {args.min_sensor_lines})"
+    # RFID is intentionally not a rejection reason: most gestures don't involve
+    # the reader at all (only `soli`/`fist_open` do), so a trial with zero RFID
+    # reads is expected and fine. Whatever RFID lines do come in are still
+    # written to rfid.csv regardless -- this function only decides whether to
+    # discard a trial, not what gets logged.
     return None
 
 
@@ -656,7 +654,7 @@ def main() -> int:
                     logger.write_event("trial_end", trial_id, gesture, args.collector, now=trial_end)
                     logger.drain(trial_end)
 
-                    reject_reason = trial_ok(sensors, args, trial_start, trial_end, rfid_epcs=rfid_epcs)
+                    reject_reason = trial_ok(sensors, args, trial_start, trial_end)
                     if reject_reason is not None:
                         print(f"Discarded: {reject_reason}.")
                         logger.write_event("trial_reject", trial_id, gesture, args.collector)
