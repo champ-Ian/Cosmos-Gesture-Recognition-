@@ -236,6 +236,17 @@ def main() -> int:
         raise SystemExit("No trials found. Expected trials.csv or trial_metadata.json files.")
 
     per_sensor_examples, labels, collectors, sources, session_dirs, skipped = build_examples(rows, sensors)
+    if skipped:
+        reason_counts: dict[str, int] = {}
+        for entry in skipped:
+            reason_counts[entry["reason"]] = reason_counts.get(entry["reason"], 0) + 1
+        print(f"Skipped {len(skipped)}/{len(rows)} rows:")
+        for reason, count in sorted(reason_counts.items(), key=lambda item: -item[1]):
+            print(f"  {count:4d}  {reason}")
+        kept_labels = sorted(set(labels))
+        skipped_labels = sorted({entry["gesture"] for entry in skipped} - set(kept_labels))
+        if skipped_labels:
+            print(f"Gestures with zero usable trials: {', '.join(skipped_labels)}")
     if len(set(labels)) < 2:
         raise SystemExit("Need at least two gesture classes to train.")
     if len(labels) < 4:
