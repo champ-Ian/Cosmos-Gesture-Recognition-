@@ -7,7 +7,7 @@ single sensor gives you the "single-sensor baseline" the project rubric
 asks for; multiple sensors gives you the "fused model" to compare against
 it), a fusion strategy (`--fusion early|late`, see the project spec's
 Fusion type table), and a classifier to compare against another run
-(`--classifier knn|svm_linear`).
+(`--classifier knn|svm_linear|cnn`).
 
 Only trials where `sensors_enabled` (in trials.csv) includes every sensor in
 `--sensors`, and where every one of those sensors' features can actually be
@@ -55,10 +55,15 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated sensor subset to use, e.g. 'mmwave' or 'mmwave,imu,uwb'.",
     )
     parser.add_argument("--fusion", choices=["early", "late"], default="early", help="How to combine multiple sensors.")
-    parser.add_argument("--classifier", choices=["knn", "svm_linear"], default="knn")
+    parser.add_argument("--classifier", choices=["knn", "svm_linear", "cnn"], default="knn")
     parser.add_argument("--svm-c", type=float, default=1.0)
     parser.add_argument("--knn-neighbors", type=int, default=5)
     parser.add_argument("--knn-weights", choices=["uniform", "distance"], default="distance")
+    parser.add_argument("--cnn-epochs", type=int, default=200, help="Training epochs for --classifier cnn.")
+    parser.add_argument("--cnn-lr", type=float, default=1e-3, help="Adam learning rate for --classifier cnn.")
+    parser.add_argument("--cnn-hidden-channels", type=int, default=32, help="Conv1d channel width for --classifier cnn.")
+    parser.add_argument("--cnn-dropout", type=float, default=0.3, help="Dropout before the final layer for --classifier cnn.")
+    parser.add_argument("--cnn-batch-size", type=int, default=16, help="Batch size for --classifier cnn.")
     parser.add_argument("--test-size", type=float, default=0.25)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument(
@@ -284,7 +289,17 @@ def main() -> int:
         X_train = np.hstack([per_sensor_X_train[s] for s in sensors])
         X_test = np.hstack([per_sensor_X_test[s] for s in sensors])
         model, classifier_params = build_classifier(
-            args.classifier, len(X_train), args.random_state, args.svm_c, args.knn_neighbors, args.knn_weights
+            args.classifier,
+            len(X_train),
+            args.random_state,
+            args.svm_c,
+            args.knn_neighbors,
+            args.knn_weights,
+            args.cnn_epochs,
+            args.cnn_lr,
+            args.cnn_hidden_channels,
+            args.cnn_dropout,
+            args.cnn_batch_size,
         )
         model.fit(X_train, y_train)
         predictions = model.predict(X_test)
@@ -294,7 +309,17 @@ def main() -> int:
         classifier_params = {}
         for sensor in sensors:
             sub_model, params = build_classifier(
-                args.classifier, len(per_sensor_X_train[sensor]), args.random_state, args.svm_c, args.knn_neighbors, args.knn_weights
+                args.classifier,
+                len(per_sensor_X_train[sensor]),
+                args.random_state,
+                args.svm_c,
+                args.knn_neighbors,
+                args.knn_weights,
+                args.cnn_epochs,
+                args.cnn_lr,
+                args.cnn_hidden_channels,
+                args.cnn_dropout,
+                args.cnn_batch_size,
             )
             sub_model.fit(per_sensor_X_train[sensor], y_train)
             sensor_models[sensor] = sub_model
