@@ -102,8 +102,10 @@ class _CNN1D:
 
         return nn.Sequential(
             nn.Conv1d(1, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_channels),
             nn.ReLU(),
             nn.Conv1d(hidden_channels, hidden_channels * 2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_channels * 2),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
