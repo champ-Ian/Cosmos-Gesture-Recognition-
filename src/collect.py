@@ -32,28 +32,17 @@ Two gesture-collection modes (see `gestures.py`'s `GestureSpec.group`):
       examples -- NOT one.
 
 Class balance: because periodic trials get multiplied into several examples
-by segmentation while discrete trials don't, running the same `--trials`
-count for both groups over-represents periodic gestures in the trained
-model. The defaults below are chosen so a discrete trial and one periodic
-segment are the same length (`--duration` == `--segment-length`, both 3s) --
-that makes examples-per-second-recorded equal across both groups, so you
-just need matching *trial counts* (accounting for periodic's 3x multiplier
-per trial) to get roughly equal examples per gesture. Collect discrete and
-periodic gestures in separate commands so each can use its own `--trials`:
+by segmentation (`floor(periodic_duration / segment_length)` per trial, 3 at
+the defaults below) while discrete trials aren't segmented at all (1 example
+each), running the same `--trials` count for both groups over-represents
+periodic gestures in the trained model. Rather than inflating discrete
+trials to match (unnecessary extra reps), collect periodic gestures with
+FEWER trials than discrete -- roughly `discrete_trials / segments_per_trial`
+-- since each periodic trial already yields multiple examples. Collect
+discrete and periodic gestures in separate commands so each can use its own
+`--trials`:
 
-    # Periodic gestures (5): --trials 8 x 3 segments/trial (9s / 3s) = 24 examples/gesture
-    python src/collect.py \\
-        --collector student01 \\
-        --mmwave-port /dev/cu.usbserial-XXXX \\
-        --imu-port /dev/cu.usbserial-YYYY \\
-        --uwb-anchor-port /dev/cu.usbmodemZZZZ \\
-        --uwb-node-port /dev/cu.usbmodemWWWW \\
-        --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
-        --rfid \\
-        --gesture one_arm_boxing,clapping,two_arm_boxing,soli,palm_up_down \\
-        --trials 8
-
-    # Discrete gestures (10): --trials 24 x 1 example/trial = 24 examples/gesture
+    # Discrete gestures (10): --trials 8 x 1 example/trial = 8 examples/gesture
     python src/collect.py \\
         --collector student01 \\
         --mmwave-port /dev/cu.usbserial-XXXX \\
@@ -63,7 +52,19 @@ periodic gestures in separate commands so each can use its own `--trials`:
         --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
         --rfid \\
         --gesture pull,push,clockwise,anti_clockwise,right,left,bye_bye,t_arm,raise_arms,fist_open \\
-        --trials 24
+        --trials 8
+
+    # Periodic gestures (5): --trials 3 x 3 segments/trial (9s / 3s) = 9 examples/gesture
+    python src/collect.py \\
+        --collector student01 \\
+        --mmwave-port /dev/cu.usbserial-XXXX \\
+        --imu-port /dev/cu.usbserial-YYYY \\
+        --uwb-anchor-port /dev/cu.usbmodemZZZZ \\
+        --uwb-node-port /dev/cu.usbmodemWWWW \\
+        --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
+        --rfid \\
+        --gesture one_arm_boxing,clapping,two_arm_boxing,soli,palm_up_down \\
+        --trials 3
 
 Output layout (`data/raw/session_<collector>_<timestamp>/`):
     session_metadata.json
@@ -137,9 +138,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help=(
-            "Trials/takes to collect per gesture. For class balance, use a higher count when "
-            "collecting discrete gestures alone (see module docstring) since each discrete trial "
-            "is only one training example, unlike periodic trials."
+            "Trials/takes to collect per gesture. Default suits discrete gestures (1 example/trial). "
+            "For class balance, use FEWER trials when collecting periodic gestures alone (see module "
+            "docstring) since each periodic trial is segmented into several training examples."
         ),
     )
     parser.add_argument(
