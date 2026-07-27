@@ -58,6 +58,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -566,6 +568,84 @@ def trial_ok(
     return None
 
 
+def plot_trial_quality(
+    sensors: SensorSet, trial_start: float, trial_end: float, trial_id: str, plots_dir: Path
+) -> Path | None:
+    """Save a quick-look plot of each enabled sensor's data during this trial window.
+
+    Purely a human sanity-check aid (flat lines / all-red UWB dots / a silent
+    mmWave panel are all visually obvious signs of a bad trial) -- it doesn't
+    feed into `trial_ok()`'s accept/reject logic at all. Returns None (and
+    prints why) if matplotlib isn't available or no sensor had any data.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")  # write-only backend -- never opens a GUI window itself
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Skipping quality plot: matplotlib not installed.")
+        return None
+
+    panels: list[tuple] = []
+
+    if sensors.mmwave is not None:
+        window = sensors.mmwave.window(trial_start, trial_end)
+        if len(window["time_s"]):
+            energy = (
+                np.nansum(window["range_profile"], axis=1)
+                if window["range_profile"].size
+                else np.zeros(len(window["time_s"]))
+            )
+            panels.append(("mmWave energy", window["time_s"], energy, "energy (sum)", None))
+            panels.append(("mmWave point count", window["time_s"], window["point_count"], "# points", None))
+
+    if sensors.imu is not None:
+        parsed = [(t, parse_imu_line(line)) for t, line in sensors.imu.window(trial_start, trial_end)]
+        parsed = [(t, values) for t, values in parsed if values is not None]
+        if parsed:
+            t = np.array([t for t, _ in parsed])
+            accel_mag = np.array([(ax**2 + ay**2 + az**2) ** 0.5 for _, (ax, ay, az, *_rest) in parsed])
+            panels.append(("IMU |accel| (g)", t, accel_mag, "|accel| (g)", None))
+
+    if sensors.uwb is not None:
+        window = sensors.uwb.window(trial_start, trial_end)
+        if len(window["time_s"]):
+            ok_mask = window["status"] == "Ok"
+            panels.append(("UWB distance (green=Ok, red=failed)", window["time_s"], window["distance_cm"], "distance (cm)", ok_mask))
+
+    if sensors.rfid is not None:
+        lines = sensors.rfid.window(trial_start, trial_end)
+        if lines:
+            t = np.array([rel_t for rel_t, _ in lines])
+            panels.append(("RFID reads (cumulative)", t, np.arange(1, len(t) + 1), "# reads", None))
+
+    if not panels:
+        print("Skipping quality plot: no sensor had any data in this trial window.")
+        return None
+
+    fig, axes = plt.subplots(len(panels), 1, figsize=(7, 2.2 * len(panels)), squeeze=False)
+    for (ax,), (title, t, y, ylabel, ok_mask) in zip(axes, panels):
+        if ok_mask is None:
+            ax.plot(t, y, linewidth=1)
+        else:
+            ax.scatter(t[ok_mask], y[ok_mask], s=10, c="tab:green", label="Ok")
+            ax.scatter(t[~ok_mask], y[~ok_mask], s=10, c="tab:red", label="failed")
+            ax.legend(loc="upper right", fontsize=7)
+        ax.set_title(title, fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.tick_params(labelsize=7)
+    axes[-1][0].set_xlabel("time (s)", fontsize=8)
+    fig.suptitle(trial_id, fontsize=10)
+    fig.tight_layout()
+
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    out_path = plots_dir / f"{trial_id}.png"
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    return out_path
+
+
 def make_session_metadata(args: argparse.Namespace, gesture_list: list[str], sensors: SensorSet) -> dict:
     return {
         "dataset_name": args.dataset_name,
@@ -653,6 +733,17 @@ def main() -> int:
                     logger.write_event("trial_start", trial_id, gesture, args.collector, now=trial_start)
                     logger.write_event("trial_end", trial_id, gesture, args.collector, now=trial_end)
                     logger.drain(trial_end)
+
+                    plot_path = plot_trial_quality(
+                        sensors, trial_start, trial_end, trial_id, session_dir / "trial_plots"
+                    )
+                    if plot_path is not None:
+                        print(f"Quality plot saved: {plot_path}")
+                        if not args.auto_accept and sys.platform == "darwin":
+                            try:
+                                subprocess.Popen(["open", str(plot_path)])
+                            except OSError:
+                                pass
 
                     reject_reason = trial_ok(sensors, args, trial_start, trial_end)
                     if reject_reason is not None:

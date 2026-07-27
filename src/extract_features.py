@@ -365,6 +365,147 @@ def feature_names_for_sensors(sensors: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Raw-sequence features -- the "actual signal shape" alternative to the
+# hand-engineered summary stats above, for models that want to learn their
+# own patterns (a neural network) instead of being handed pre-computed
+# mean/std/energy numbers.
+#
+# Every trial has a different sample count (durations vary; UWB/RFID/IMU
+# sampling isn't perfectly steady), but a fixed-input-size model needs a
+# fixed-length vector. Each extractor below resamples its sensor's raw time
+# series onto RAW_SEQUENCE_STEPS evenly-spaced points (linear interpolation
+# over relative time) and flattens that -- this keeps the *shape* of the
+# signal (e.g. an IMU rotation curve), which the mean/std features above
+# throw away, without needing a sequence-aware model this project doesn't
+# otherwise depend on (no PyTorch/TensorFlow here, just sklearn).
+#
+# Honest tradeoff: this is far higher-dimensional per trial than the summary
+# stats (roughly 200 numbers per trial for a 4-sensor fusion, vs. ~50), and
+# this project's realistic per-class trial counts (single digits to low tens)
+# are small for that. A plain MLP on raw resampled sequences can easily do
+# WORSE than the summary-stat version with this little data, not better --
+# compare both empirically (train.py's --features stats vs --features raw)
+# rather than assuming raw is strictly an upgrade.
+
+RAW_SEQUENCE_STEPS = 20
+
+
+def _resample_to_fixed_length(times: np.ndarray, values: np.ndarray, num_steps: int) -> np.ndarray:
+    """Linearly resample `values` (sampled at `times`) onto `num_steps` evenly-spaced points."""
+    if len(times) == 0:
+        return np.zeros(num_steps)
+    if len(times) == 1:
+        return np.full(num_steps, float(values[0]))
+    grid = np.linspace(float(times[0]), float(times[-1]), num_steps)
+    return np.interp(grid, times, values)
+
+
+def extract_mmwave_raw_sequence(npz) -> list[float] | None:
+    frame_count = len(npz["mmwave_frame_number"])
+    if frame_count == 0:
+        return None
+    time_s = npz["mmwave_time_s"]
+    range_profile = npz["mmwave_range_profile"]
+    energy = np.nansum(range_profile, axis=1) if range_profile.size else np.zeros(frame_count)
+    point_count = npz["mmwave_point_count"].astype(float)
+    energy_seq = _resample_to_fixed_length(time_s, energy, RAW_SEQUENCE_STEPS)
+    points_seq = _resample_to_fixed_length(time_s, point_count, RAW_SEQUENCE_STEPS)
+    return [float(v) for v in np.concatenate([energy_seq, points_seq])]
+
+
+MMWAVE_RAW_FEATURE_NAMES = [f"mmwave_raw_energy_{i}" for i in range(RAW_SEQUENCE_STEPS)] + [
+    f"mmwave_raw_points_{i}" for i in range(RAW_SEQUENCE_STEPS)
+]
+
+
+def extract_imu_raw_sequence(npz) -> list[float] | None:
+    raw_lines = npz["imu_raw_lines"]
+    recv_time_s = npz["imu_recv_time_s"]
+    times: list[float] = []
+    samples: list[tuple[float, ...]] = []
+    for t, line in zip(recv_time_s, raw_lines):
+        parsed = parse_imu_line(line)
+        if parsed is not None:
+            times.append(float(t))
+            samples.append(parsed)
+    if len(samples) < 2:
+        return None
+    times_array = np.array(times, dtype=float)
+    samples_array = np.array(samples, dtype=float)
+    sequences = [
+        _resample_to_fixed_length(times_array, samples_array[:, axis_index], RAW_SEQUENCE_STEPS)
+        for axis_index in range(6)
+    ]
+    return [float(v) for v in np.concatenate(sequences)]
+
+
+IMU_RAW_FEATURE_NAMES = [f"imu_raw_{axis}_{i}" for axis in IMU_AXES for i in range(RAW_SEQUENCE_STEPS)]
+
+
+def extract_uwb_raw_sequence(npz) -> list[float] | None:
+    status = npz["uwb_status"]
+    distance_cm = npz["uwb_distance_cm"]
+    time_s = npz["uwb_time_s"]
+    ok_mask = status == "Ok"
+    values = distance_cm[ok_mask].astype(float)
+    times = time_s[ok_mask].astype(float)
+    finite_mask = np.isfinite(values) & (values > 0) & (values < 60000)
+    values = values[finite_mask]
+    times = times[finite_mask]
+    if len(values) < 2:
+        return None
+    return [float(v) for v in _resample_to_fixed_length(times, values, RAW_SEQUENCE_STEPS)]
+
+
+UWB_RAW_FEATURE_NAMES = [f"uwb_raw_distance_{i}" for i in range(RAW_SEQUENCE_STEPS)]
+
+
+def extract_rfid_raw_sequence(npz) -> list[float] | None:
+    raw_lines = npz["rfid_raw_lines"]
+    recv_time_s = npz["rfid_recv_time_s"]
+    times: list[float] = []
+    rssi_values: list[float] = []
+    for t, line in zip(recv_time_s, raw_lines):
+        parsed = parse_rfid_line(line)
+        if parsed is not None:
+            times.append(float(t))
+            rssi_values.append(float(parsed[1]))
+    if len(rssi_values) < 2:
+        return None
+    return [
+        float(v)
+        for v in _resample_to_fixed_length(np.array(times, dtype=float), np.array(rssi_values, dtype=float), RAW_SEQUENCE_STEPS)
+    ]
+
+
+RFID_RAW_FEATURE_NAMES = [f"rfid_raw_rssi_{i}" for i in range(RAW_SEQUENCE_STEPS)]
+
+
+RAW_FEATURE_SPECS = {
+    "mmwave": (extract_mmwave_raw_sequence, MMWAVE_RAW_FEATURE_NAMES),
+    "imu": (extract_imu_raw_sequence, IMU_RAW_FEATURE_NAMES),
+    "uwb": (extract_uwb_raw_sequence, UWB_RAW_FEATURE_NAMES),
+    "rfid": (extract_rfid_raw_sequence, RFID_RAW_FEATURE_NAMES),
+}
+
+
+def raw_feature_names_for_sensor(sensor: str) -> list[str]:
+    return list(RAW_FEATURE_SPECS[sensor][1])
+
+
+def extract_sensor_raw_sequence(sensor: str, npz) -> list[float] | None:
+    extractor, _ = RAW_FEATURE_SPECS[sensor]
+    return extractor(npz)
+
+
+def raw_feature_names_for_sensors(sensors: list[str]) -> list[str]:
+    names: list[str] = []
+    for sensor in sensors:
+        names.extend(raw_feature_names_for_sensor(sensor))
+    return names
+
+
+# ---------------------------------------------------------------------------
 # Cutting a raw collect.py session into a processed per-trial dataset
 # ---------------------------------------------------------------------------
 #
