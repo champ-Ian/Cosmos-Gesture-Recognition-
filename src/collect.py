@@ -22,22 +22,26 @@ only job is to stream, prompt, and log.
 
 Two gesture-collection modes (see `gestures.py`'s `GestureSpec.group`):
     - "discrete" gestures (Pull, Push, Clockwise, ...): trial-by-trial,
-      prompt -> countdown -> record `--duration` seconds -> keep/redo.
+      prompt -> countdown -> record `--duration` seconds -> keep/redo. Each
+      trial becomes exactly one training example.
     - "periodic" gestures (Clapping, boxing, Palm Up-Down, Soli): one long
       continuous take per trial (`--periodic-duration` seconds); segmenting
       that into individual cycles happens later, in the cut step
-      (`--segment-length`/`--segment-stride`).
+      (`--segment-length`/`--segment-stride`, default 3.0s/non-overlapping).
+      Each trial becomes `floor(periodic_duration / segment_length)` training
+      examples -- NOT one.
 
-Output layout (`data/raw/session_<collector>_<timestamp>/`):
-    session_metadata.json
-    events.csv
-    trials.csv                 (accepted trials only)
-    imu.csv, uwb.csv, rfid.csv, mmwave.npz   (whichever sensors are enabled)
-    uwb_logs/                  (UWB anchor/node subprocess logs, if enabled)
+Class balance: because periodic trials get multiplied into several examples
+by segmentation while discrete trials don't, running the same `--trials`
+count for both groups over-represents periodic gestures in the trained
+model. The defaults below are chosen so a discrete trial and one periodic
+segment are the same length (`--duration` == `--segment-length`, both 3s) --
+that makes examples-per-second-recorded equal across both groups, so you
+just need matching *trial counts* (accounting for periodic's 3x multiplier
+per trial) to get roughly equal examples per gesture. Collect discrete and
+periodic gestures in separate commands so each can use its own `--trials`:
 
-Example (run from the repo root; all four sensors, discrete + periodic
-gestures in one session):
-
+    # Periodic gestures (5): --trials 8 x 3 segments/trial (9s / 3s) = 24 examples/gesture
     python src/collect.py \\
         --collector student01 \\
         --mmwave-port /dev/cu.usbserial-XXXX \\
@@ -46,8 +50,27 @@ gestures in one session):
         --uwb-node-port /dev/cu.usbmodemWWWW \\
         --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
         --rfid \\
-        --gesture pull,push,clapping \\
-        --trials 5 --duration 4 --periodic-duration 20
+        --gesture one_arm_boxing,clapping,two_arm_boxing,soli,palm_up_down \\
+        --trials 8
+
+    # Discrete gestures (10): --trials 24 x 1 example/trial = 24 examples/gesture
+    python src/collect.py \\
+        --collector student01 \\
+        --mmwave-port /dev/cu.usbserial-XXXX \\
+        --imu-port /dev/cu.usbserial-YYYY \\
+        --uwb-anchor-port /dev/cu.usbmodemZZZZ \\
+        --uwb-node-port /dev/cu.usbmodemWWWW \\
+        --uwb-group-id 1 --uwb-preamble-code 9 --uwb-channel 5 \\
+        --rfid \\
+        --gesture pull,push,clockwise,anti_clockwise,right,left,bye_bye,t_arm,raise_arms,fist_open \\
+        --trials 24
+
+Output layout (`data/raw/session_<collector>_<timestamp>/`):
+    session_metadata.json
+    events.csv
+    trials.csv                 (accepted trials only)
+    imu.csv, uwb.csv, rfid.csv, mmwave.npz   (whichever sensors are enabled)
+    uwb_logs/                  (UWB anchor/node subprocess logs, if enabled)
 
 Then cut the raw session into a processed dataset:
 
@@ -109,13 +132,30 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="Gesture label (see gestures.py). Can be repeated or comma separated. Default: all 15 gestures.",
     )
-    parser.add_argument("--trials", type=int, default=5, help="Trials/takes to collect per gesture.")
-    parser.add_argument("--duration", type=float, default=4.0, help="Seconds per discrete-gesture trial.")
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=8,
+        help=(
+            "Trials/takes to collect per gesture. For class balance, use a higher count when "
+            "collecting discrete gestures alone (see module docstring) since each discrete trial "
+            "is only one training example, unlike periodic trials."
+        ),
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=3.0,
+        help="Seconds per discrete-gesture trial. Matches --segment-length so example density (examples/sec) matches periodic gestures.",
+    )
     parser.add_argument(
         "--periodic-duration",
         type=float,
-        default=20.0,
-        help="Seconds per periodic-gesture continuous take (segmented later by extract_features.py cut).",
+        default=9.0,
+        help=(
+            "Seconds per periodic-gesture continuous take (segmented later by extract_features.py cut). "
+            "Default gives 3 segments/trial at the default --segment-length of 3.0s."
+        ),
     )
     parser.add_argument("--dataset-name", default=f"session_{timestamp()}")
     parser.add_argument("--out-root", default=str(DATA_RAW_DIR))
