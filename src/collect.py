@@ -680,7 +680,28 @@ def plot_trial_quality(
             ok_mask = panel["ok_mask"]
             t, y = panel["t"], panel["y"]
             ax.scatter(t[ok_mask], y[ok_mask], s=10, c="tab:green", label="Ok")
-            ax.scatter(t[~ok_mask], y[~ok_mask], s=10, c="tab:red", label="failed")
+            # distance_cm on a failed sample (e.g. RangingRxTimeout) is garbage --
+            # the device still fills that field even when the ranging round failed.
+            # Scale the axis off Ok values only, then draw failures as a rug along
+            # the bottom instead of at their bogus distance (which used to blow out
+            # the whole plot's scale).
+            if ok_mask.any():
+                y_ok = y[ok_mask]
+                span = float(y_ok.max() - y_ok.min())
+                pad = max(1.0, 0.1 * span)
+                ylo, yhi = float(y_ok.min() - pad), float(y_ok.max() + pad)
+            else:
+                ylo, yhi = 0.0, 1.0
+            ax.set_ylim(ylo, yhi)
+            if (~ok_mask).any():
+                ax.scatter(
+                    t[~ok_mask],
+                    np.full(np.count_nonzero(~ok_mask), ylo),
+                    s=30,
+                    c="tab:red",
+                    marker="|",
+                    label="failed",
+                )
             ax.legend(loc="upper right", fontsize=7)
         elif kind == "multiline":
             for series_index, series_label in enumerate(panel["series_labels"]):
