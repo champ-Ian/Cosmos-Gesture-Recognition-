@@ -9,6 +9,13 @@ it), a fusion strategy (`--fusion early|late`, see the project spec's
 Fusion type table), and a classifier to compare against another run
 (`--classifier knn|svm_linear`).
 
+`--features stats` (default) uses hand-engineered summary-stat features
+(mean/std/energy/etc, see extract_features.py). `--features raw` instead
+resamples each sensor's raw time series to a fixed number of steps and
+flattens that -- closer to what "feed a neural net raw data" usually means,
+at the cost of much higher dimensionality per trial. Compare both, don't
+assume raw is strictly better with a small dataset.
+
 Only trials where `sensors_enabled` (in trials.csv) includes every sensor in
 `--sensors`, and where every one of those sensors' features can actually be
 extracted (see extract_features.py), are used -- this keeps early/late
@@ -284,7 +291,12 @@ def main() -> int:
         X_train = np.hstack([per_sensor_X_train[s] for s in sensors])
         X_test = np.hstack([per_sensor_X_test[s] for s in sensors])
         model, classifier_params = build_classifier(
-            args.classifier, len(X_train), args.random_state, args.svm_c, args.knn_neighbors, args.knn_weights
+            args.classifier,
+            len(X_train),
+            args.random_state,
+            args.svm_c,
+            args.knn_neighbors,
+            args.knn_weights,
         )
         model.fit(X_train, y_train)
         predictions = model.predict(X_test)
@@ -294,7 +306,12 @@ def main() -> int:
         classifier_params = {}
         for sensor in sensors:
             sub_model, params = build_classifier(
-                args.classifier, len(per_sensor_X_train[sensor]), args.random_state, args.svm_c, args.knn_neighbors, args.knn_weights
+                args.classifier,
+                len(per_sensor_X_train[sensor]),
+                args.random_state,
+                args.svm_c,
+                args.knn_neighbors,
+                args.knn_weights,
             )
             sub_model.fit(per_sensor_X_train[sensor], y_train)
             sensor_models[sensor] = sub_model

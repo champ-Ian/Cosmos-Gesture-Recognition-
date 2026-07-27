@@ -587,53 +587,117 @@ def plot_trial_quality(
         print("Skipping quality plot: matplotlib not installed.")
         return None
 
-    panels: list[tuple] = []
+    panels: list[dict] = []
 
     if sensors.mmwave is not None:
         window = sensors.mmwave.window(trial_start, trial_end)
-        if len(window["time_s"]):
-            energy = (
-                np.nansum(window["range_profile"], axis=1)
-                if window["range_profile"].size
-                else np.zeros(len(window["time_s"]))
+        if len(window["time_s"]) and window["range_profile"].size:
+            panels.append(
+                {
+                    "kind": "waterfall",
+                    "title": "mmWave range-time waterfall",
+                    "t": window["time_s"],
+                    "matrix": window["range_profile"],  # (frames, range_bins)
+                    "ylabel": "range bin",
+                }
             )
-            panels.append(("mmWave energy", window["time_s"], energy, "energy (sum)", None))
-            panels.append(("mmWave point count", window["time_s"], window["point_count"], "# points", None))
+        if len(window["time_s"]):
+            panels.append(
+                {
+                    "kind": "line",
+                    "title": "mmWave point count",
+                    "t": window["time_s"],
+                    "y": window["point_count"],
+                    "ylabel": "# points",
+                }
+            )
 
     if sensors.imu is not None:
         parsed = [(t, parse_imu_line(line)) for t, line in sensors.imu.window(trial_start, trial_end)]
         parsed = [(t, values) for t, values in parsed if values is not None]
         if parsed:
             t = np.array([t for t, _ in parsed])
-            accel_mag = np.array([(ax**2 + ay**2 + az**2) ** 0.5 for _, (ax, ay, az, *_rest) in parsed])
-            panels.append(("IMU |accel| (g)", t, accel_mag, "|accel| (g)", None))
+            samples = np.array([values for _, values in parsed])  # (n, 6): ax,ay,az,gx,gy,gz
+            panels.append(
+                {
+                    "kind": "multiline",
+                    "title": "IMU acceleration",
+                    "t": t,
+                    "series": samples[:, 0:3],
+                    "series_labels": ("ax", "ay", "az"),
+                    "ylabel": "accel (g)",
+                }
+            )
+            panels.append(
+                {
+                    "kind": "multiline",
+                    "title": "IMU gyroscope",
+                    "t": t,
+                    "series": samples[:, 3:6],
+                    "series_labels": ("gx", "gy", "gz"),
+                    "ylabel": "gyro (dps)",
+                }
+            )
 
     if sensors.uwb is not None:
         window = sensors.uwb.window(trial_start, trial_end)
         if len(window["time_s"]):
-            ok_mask = window["status"] == "Ok"
-            panels.append(("UWB distance (green=Ok, red=failed)", window["time_s"], window["distance_cm"], "distance (cm)", ok_mask))
+            panels.append(
+                {
+                    "kind": "scatter_ok",
+                    "title": "UWB distance (green=Ok, red=failed)",
+                    "t": window["time_s"],
+                    "y": window["distance_cm"],
+                    "ok_mask": window["status"] == "Ok",
+                    "ylabel": "distance (cm)",
+                }
+            )
 
     if sensors.rfid is not None:
         lines = sensors.rfid.window(trial_start, trial_end)
         if lines:
             t = np.array([rel_t for rel_t, _ in lines])
-            panels.append(("RFID reads (cumulative)", t, np.arange(1, len(t) + 1), "# reads", None))
+            panels.append(
+                {
+                    "kind": "line",
+                    "title": "RFID reads (cumulative)",
+                    "t": t,
+                    "y": np.arange(1, len(t) + 1),
+                    "ylabel": "# reads",
+                }
+            )
 
     if not panels:
         print("Skipping quality plot: no sensor had any data in this trial window.")
         return None
 
-    fig, axes = plt.subplots(len(panels), 1, figsize=(7, 2.2 * len(panels)), squeeze=False)
-    for (ax,), (title, t, y, ylabel, ok_mask) in zip(axes, panels):
-        if ok_mask is None:
-            ax.plot(t, y, linewidth=1)
-        else:
+    fig, axes = plt.subplots(len(panels), 1, figsize=(7, 2.4 * len(panels)), squeeze=False)
+    for (ax,), panel in zip(axes, panels):
+        kind = panel["kind"]
+        if kind == "line":
+            ax.plot(panel["t"], panel["y"], linewidth=1)
+        elif kind == "scatter_ok":
+            ok_mask = panel["ok_mask"]
+            t, y = panel["t"], panel["y"]
             ax.scatter(t[ok_mask], y[ok_mask], s=10, c="tab:green", label="Ok")
             ax.scatter(t[~ok_mask], y[~ok_mask], s=10, c="tab:red", label="failed")
             ax.legend(loc="upper right", fontsize=7)
-        ax.set_title(title, fontsize=9)
-        ax.set_ylabel(ylabel, fontsize=8)
+        elif kind == "multiline":
+            for series_index, series_label in enumerate(panel["series_labels"]):
+                ax.plot(panel["t"], panel["series"][:, series_index], linewidth=1, label=series_label)
+            ax.legend(loc="upper right", fontsize=7, ncol=3)
+        elif kind == "waterfall":
+            t, matrix = panel["t"], panel["matrix"]
+            image = ax.imshow(
+                matrix.T,
+                aspect="auto",
+                origin="lower",
+                extent=[float(t[0]), float(t[-1]), 0, matrix.shape[1]],
+                cmap="viridis",
+            )
+            fig.colorbar(image, ax=ax, pad=0.01).ax.tick_params(labelsize=6)
+        ax.set_title(panel["title"], fontsize=9)
+        ax.set_ylabel(panel["ylabel"], fontsize=8)
         ax.tick_params(labelsize=7)
     axes[-1][0].set_xlabel("time (s)", fontsize=8)
     fig.suptitle(trial_id, fontsize=10)
