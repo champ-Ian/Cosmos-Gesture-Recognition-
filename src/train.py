@@ -148,8 +148,18 @@ def resolve_path(dataset_dir: Path, value: str, default: Path) -> Path:
     return path if path.is_absolute() else (dataset_dir / path).resolve()
 
 
-def build_examples(rows: list[dict], sensors: list[str]) -> tuple[dict, list, list, list, list, list]:
-    """Returns (per_sensor_examples, labels, collectors, sources, session_dirs, skipped)."""
+def build_examples(
+    rows: list[dict],
+    sensors: list[str],
+    feature_extractor=extract_sensor_features,
+) -> tuple[dict, list, list, list, list, list]:
+    """Returns (per_sensor_examples, labels, collectors, sources, session_dirs, skipped).
+
+    `feature_extractor(sensor, npz) -> list[float] | None` defaults to the mean/std/min/max
+    summary stats used for training; pass `extract_sensor_raw_sequence` (see extract_features.py)
+    to get fixed-length raw-ish resampled sequences instead (used by export_features_csv.py's
+    `--feature-mode raw`).
+    """
     per_sensor_examples: dict[str, list] = {sensor: [] for sensor in sensors}
     labels: list[str] = []
     collectors: list[str] = []
@@ -176,7 +186,7 @@ def build_examples(rows: list[dict], sensors: list[str]) -> tuple[dict, list, li
             per_sensor_vectors = {}
             ok = True
             for sensor in sensors:
-                vector = extract_sensor_features(sensor, npz)
+                vector = feature_extractor(sensor, npz)
                 if vector is None:
                     ok = False
                     break

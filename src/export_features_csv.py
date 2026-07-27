@@ -15,8 +15,17 @@ Run from the repo root:
       --output data/processed/student1_minimodel/features.csv
 
 The output has columns: gesture, collector, source_dataset, session_dir,
-then one column per feature (see extract_features.py's *_FEATURE_NAMES for
-what each one means), in the same order train.py's early-fusion vector uses.
+then one column per feature, in the same order train.py's early-fusion
+vector uses. `--feature-mode` controls what those feature columns are (see
+extract_features.py's *_FEATURE_NAMES for what each one means):
+
+    summary (default) -- mean/std/min/max per axis, one row-vector regardless
+        of how many raw samples a trial had.
+    raw -- each sensor's raw stream resampled onto a fixed 20-point sequence
+        per axis (e.g. imu_raw_ax_0..19), preserving shape/timing instead of
+        collapsing to a few statistics. Still fixed-length per trial (needed
+        for sklearn), just far less lossy than summary stats.
+    both -- summary columns AND raw columns together, per sensor, in one CSV.
 """
 from __future__ import annotations
 
@@ -24,8 +33,31 @@ import argparse
 import csv
 from pathlib import Path
 
-from extract_features import feature_names_for_sensors
+from extract_features import (
+    extract_sensor_features,
+    extract_sensor_raw_sequence,
+    feature_names_for_sensor,
+    feature_names_for_sensors,
+    raw_feature_names_for_sensor,
+    raw_feature_names_for_sensors,
+)
 from train import build_examples, normalize_sensor_list, read_manifests
+
+
+def combined_sensor_features(sensor: str, npz) -> list[float] | None:
+    summary = extract_sensor_features(sensor, npz)
+    raw = extract_sensor_raw_sequence(sensor, npz)
+    if summary is None or raw is None:
+        return None
+    return summary + raw
+
+
+def combined_feature_names(sensors: list[str]) -> list[str]:
+    names: list[str] = []
+    for sensor in sensors:
+        names.extend(feature_names_for_sensor(sensor))
+        names.extend(raw_feature_names_for_sensor(sensor))
+    return names
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +65,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("datasets", nargs="+", help="Processed dataset folders from extract_features.py cut.")
     parser.add_argument("--sensors", required=True, help="Comma-separated sensor subset, e.g. 'mmwave,imu,uwb'.")
     parser.add_argument("--output", required=True, help="Output CSV path.")
+    parser.add_argument(
+        "--feature-mode",
+        choices=["summary", "raw", "both"],
+        default="summary",
+        help=(
+            "'summary' = mean/std/min/max per axis (default). 'raw' = fixed-length resampled raw "
+            "sequence per axis. 'both' = summary and raw columns together per sensor."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -46,7 +87,18 @@ def main() -> int:
     if missing_datasets:
         print(f"Warning: no trials found in: {', '.join(missing_datasets)}")
 
-    per_sensor_examples, labels, collectors, sources, session_dirs, skipped = build_examples(rows, sensors)
+    mode_extractors = {
+        "summary": None,
+        "raw": extract_sensor_raw_sequence,
+        "both": combined_sensor_features,
+    }
+    extractor = mode_extractors[args.feature_mode]
+    if extractor is not None:
+        per_sensor_examples, labels, collectors, sources, session_dirs, skipped = build_examples(
+            rows, sensors, feature_extractor=extractor
+        )
+    else:
+        per_sensor_examples, labels, collectors, sources, session_dirs, skipped = build_examples(rows, sensors)
     if skipped:
         reason_counts: dict[str, int] = {}
         for entry in skipped:
@@ -61,7 +113,12 @@ def main() -> int:
     if not labels:
         raise SystemExit("No usable trials for the requested --sensors.")
 
-    feature_names = feature_names_for_sensors(sensors)
+    if args.feature_mode == "raw":
+        feature_names = raw_feature_names_for_sensors(sensors)
+    elif args.feature_mode == "both":
+        feature_names = combined_feature_names(sensors)
+    else:
+        feature_names = feature_names_for_sensors(sensors)
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
