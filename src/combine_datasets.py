@@ -16,6 +16,15 @@ Usage (run from the repo root):
         data/processed/STUDENT_A \\
         data/processed/STUDENT_B \\
         --output data/processed/combined
+
+If `collect.py` was run with the wrong `--collector` value (e.g. every
+session accidentally tagged the same name), relabel per source folder here
+instead of re-collecting -- suffix a dataset path with `=name` to override
+the `collector` column for every row read from that folder:
+    python src/combine_datasets.py \\
+        data/processed/ian_discrete=ian data/processed/ian_periodic=ian \\
+        data/processed/kaiwei_discrete=kaiwei data/processed/kaiwei_periodic=kaiwei \\
+        --output data/processed/combined
 """
 from __future__ import annotations
 
@@ -35,7 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "datasets",
         nargs="+",
-        help="Processed dataset folders created by extract_features.py cut.",
+        help=(
+            "Processed dataset folders created by extract_features.py cut. Suffix a path with "
+            "'=name' (e.g. data/processed/kaiwei_discrete=kaiwei) to override the collector column "
+            "for every row from that folder, e.g. to fix a wrong --collector used at collection time."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -94,6 +107,13 @@ def resolve_session_and_npz(dataset_dir: Path, row: dict[str, str]) -> tuple[Pat
     return session_dir, npz_path
 
 
+def parse_dataset_arg(item: str) -> tuple[Path, str | None]:
+    """Split an optional trailing '=collector_name' override off a dataset path."""
+    path_str, sep, override = item.partition("=")
+    collector_override = override.strip() if sep else None
+    return Path(path_str).expanduser().resolve(), (collector_override or None)
+
+
 def main() -> int:
     args = parse_args()
     output_dir = Path(args.output).expanduser().resolve()
@@ -102,14 +122,14 @@ def main() -> int:
 
     allowed_collectors = normalize_filter(args.collector)
     allowed_gestures = normalize_filter(args.gesture)
-    source_dirs = [Path(item).expanduser().resolve() for item in args.datasets]
+    source_dirs = [parse_dataset_arg(item) for item in args.datasets]
     combined: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
     gesture_counts: dict[str, int] = {}
     collector_counts: dict[str, int] = {}
     sensor_combo_counts: dict[str, int] = {}
 
-    for dataset_dir in source_dirs:
+    for dataset_dir, collector_override in source_dirs:
         try:
             rows = read_rows(dataset_dir)
         except FileNotFoundError as exc:
@@ -118,7 +138,7 @@ def main() -> int:
 
         source_name = source_dataset_name(dataset_dir)
         for row in rows:
-            collector = row.get("collector", "")
+            collector = collector_override or row.get("collector", "")
             gesture = row.get("gesture", "")
             if allowed_collectors and collector not in allowed_collectors:
                 continue
