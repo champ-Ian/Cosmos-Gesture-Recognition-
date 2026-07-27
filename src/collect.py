@@ -343,7 +343,11 @@ class SensorSet:
                 )
             if args.rfid:
                 print(f"Opening RFID reader at {args.rfid_host}:{args.rfid_tcp_port}...")
-                self.rfid = RfidReader(args.rfid_host, args.rfid_tcp_port)
+                try:
+                    self.rfid = RfidReader(args.rfid_host, args.rfid_tcp_port)
+                except OSError as error:
+                    print(f"Warning: RFID reader unreachable ({error}) -- continuing without RFID.")
+                    self.rfid = None
         except Exception:
             self.close()
             raise
@@ -792,7 +796,7 @@ def make_session_metadata(args: argparse.Namespace, gesture_list: list[str], sen
             "imu": args.imu_port,
             "uwb_anchor": args.uwb_anchor_port,
             "uwb_nodes": args.uwb_node_port,
-            "rfid": f"{args.rfid_host}:{args.rfid_tcp_port}" if args.rfid else None,
+            "rfid": f"{args.rfid_host}:{args.rfid_tcp_port}" if sensors.rfid is not None else None,
         },
         "rfid_epcs": sorted(normalize_epcs(args.rfid_epcs)) if sensors.rfid is not None and args.rfid_epcs else None,
         "uwb_config": (
