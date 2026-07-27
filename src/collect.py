@@ -243,6 +243,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the UCI device reset before/after ranging (use if it's already known-good).",
     )
+    uwb_group.add_argument(
+        "--uwb-session-duration",
+        type=int,
+        default=14400,
+        help=(
+            "Seconds the UWB anchor/node subprocesses are told to run for (default 4 hours). "
+            "This is a wall-clock timer on the underlying `run_fira_twr.py` process starting "
+            "when the session opens, independent of your actual trial time -- prompts, redos, "
+            "and quality-plot review all count against it. If it elapses before the session "
+            "ends, the anchor subprocess exits on its own and the whole collect.py run dies "
+            "with a 'UWB anchor process exited early' error. Raise this if your sessions run long."
+        ),
+    )
 
     rfid_group = parser.add_argument_group("RFID (RFID_Lab reader, TCP -- not serial)")
     rfid_group.add_argument("--rfid", action="store_true", help="Enable the RFID reader.")
@@ -340,6 +353,7 @@ class SensorSet:
                     slot_span=args.uwb_slot_span,
                     slots_per_rr=args.uwb_slots_per_rr,
                     reset_devices_first=not args.uwb_skip_device_reset,
+                    session_duration_s=args.uwb_session_duration,
                 )
             if args.rfid:
                 print(f"Opening RFID reader at {args.rfid_host}:{args.rfid_tcp_port}...")
@@ -809,6 +823,7 @@ def make_session_metadata(args: argparse.Namespace, gesture_list: list[str], sen
                 "slot_span": args.uwb_slot_span,
                 "slots_per_rr": sensors.uwb.slots_per_rr,
                 "multi_node": sensors.uwb.multi_node,
+                "session_duration_s": args.uwb_session_duration,
             }
             if sensors.uwb is not None
             else None
