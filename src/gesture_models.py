@@ -22,6 +22,7 @@ def classifier_label(classifier: str) -> str:
         "knn": "KNN",
         "svm_linear": "Linear SVM",
         "cnn": "1D-CNN",
+        "cnn_raw": "1D-CNN (raw sequences)",
     }[classifier]
 
 
@@ -205,6 +206,174 @@ class TorchCNNClassifier:
 
     def predict(self, X) -> np.ndarray:
         proba = self.predict_proba(X)
+        indices = np.argmax(proba, axis=1)
+        return np.array(self.classes_)[indices]
+
+
+class _HybridRawCNN:
+    """Builds the raw-sequence CNN from plain `nn.Sequential`/`nn.ModuleDict`
+    pieces -- a real temporal Conv1d stack over raw per-channel sequences
+    (e.g. IMU ax/ay/az/gx/gy/gz, mmWave energy/points, UWB distance, each
+    resampled to a fixed length), fused with a small dense branch over the
+    existing hand-crafted summary-stat features.
+
+    Deliberately NOT a custom `nn.Module` subclass: a class defined inside a
+    function can't be `joblib.dump`/pickle'd (pickle needs a real importable
+    qualified name), which is exactly the same reason `TorchCNNClassifier`'s
+    `_CNN1D.build` only ever returns an `nn.Sequential` of stock layers.
+    `nn.ModuleDict` is itself a stock, picklable container, so wrapping the
+    three (all-stock-layer) pieces in one lets `.parameters()`/`.train()`/
+    `.eval()` still work as if this were one module -- `TorchRawCNNClassifier`
+    just calls each piece explicitly instead of relying on a `forward()`.
+    """
+
+    @staticmethod
+    def build(raw_channels: int, scalar_dim: int, n_classes: int, hidden_channels: int, dropout: float):
+        import torch.nn as nn
+
+        conv = nn.Sequential(
+            nn.Conv1d(raw_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_channels),
+            nn.ReLU(),
+            nn.Conv1d(hidden_channels, hidden_channels * 2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_channels * 2),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+        scalar_hidden = max(8, hidden_channels // 2) if scalar_dim > 0 else 0
+        parts = {"conv": conv}
+        if scalar_dim > 0:
+            parts["scalar"] = nn.Sequential(nn.Linear(scalar_dim, scalar_hidden), nn.ReLU())
+        combined_dim = hidden_channels * 2 + scalar_hidden
+        parts["head"] = nn.Sequential(nn.Dropout(dropout), nn.Linear(combined_dim, n_classes))
+        return nn.ModuleDict(parts)
+
+
+class TorchRawCNNClassifier:
+    """1D-CNN over raw per-channel sequences (+ an optional scalar side-branch).
+
+    Unlike `TorchCNNClassifier` (which treats one flat hand-crafted feature
+    vector as a length-N single-channel signal -- there's no real temporal
+    locality between adjacent feature columns there), this convolves over an
+    actual time axis: `X_raw` is `(n_examples, n_channels, n_timesteps)`, e.g.
+    9 channels (mmwave energy/points, imu ax/ay/az/gx/gy/gz, uwb distance)
+    each resampled to a fixed length. This is what actually gets the
+    "CNN learns temporal patterns" advantage.
+
+    Not currently wired into `train.py`'s generic --classifier flag or
+    `realtime_demo.py` -- both assume a single flat feature vector per
+    example. Use directly (see `train_cnn_raw.py`) until/unless the live
+    windowing path is extended to produce matching raw resampled sequences.
+    """
+
+    def __init__(
+        self,
+        epochs: int = 200,
+        lr: float = 1e-3,
+        hidden_channels: int = 32,
+        dropout: float = 0.3,
+        batch_size: int = 16,
+        random_state: int = 42,
+    ):
+        self.epochs = epochs
+        self.lr = lr
+        self.hidden_channels = hidden_channels
+        self.dropout = dropout
+        self.batch_size = batch_size
+        self.random_state = random_state
+        self.classes_: list = []
+        self._raw_mean: np.ndarray | None = None  # (n_channels, 1)
+        self._raw_std: np.ndarray | None = None
+        self._scalar_mean: np.ndarray | None = None
+        self._scalar_std: np.ndarray | None = None
+        self._model = None
+
+    def _standardize(self, X_raw: np.ndarray, X_scalar: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        X_raw = (X_raw - self._raw_mean) / self._raw_std
+        if X_scalar.shape[1] > 0:
+            X_scalar = (X_scalar - self._scalar_mean) / self._scalar_std
+        return X_raw, X_scalar
+
+    def _forward(self, x_raw, x_scalar):
+        import torch
+
+        raw_embed = self._model["conv"](x_raw)
+        if "scalar" in self._model:
+            combined = torch.cat([raw_embed, self._model["scalar"](x_scalar)], dim=1)
+        else:
+            combined = raw_embed
+        return self._model["head"](combined)
+
+    def fit(self, X_raw, X_scalar, y) -> "TorchRawCNNClassifier":
+        import torch
+        import torch.nn as nn
+
+        torch.manual_seed(self.random_state)
+
+        X_raw = np.asarray(X_raw, dtype=np.float32)  # (N, channels, timesteps)
+        X_scalar = np.atleast_2d(np.asarray(X_scalar, dtype=np.float32))
+        if X_scalar.shape[0] != X_raw.shape[0]:
+            X_scalar = X_scalar.reshape(X_raw.shape[0], -1)
+        y = np.asarray(y)
+        self.classes_ = sorted(set(y.tolist()))
+        class_to_idx = {label: idx for idx, label in enumerate(self.classes_)}
+        y_idx = np.array([class_to_idx[label] for label in y], dtype=np.int64)
+
+        # Per-channel mean/std over all examples and timesteps combined.
+        self._raw_mean = X_raw.mean(axis=(0, 2), keepdims=True)
+        self._raw_std = X_raw.std(axis=(0, 2), keepdims=True)
+        self._raw_std[self._raw_std < 1e-8] = 1.0
+
+        scalar_dim = X_scalar.shape[1]
+        if scalar_dim > 0:
+            self._scalar_mean = X_scalar.mean(axis=0)
+            self._scalar_std = X_scalar.std(axis=0)
+            self._scalar_std[self._scalar_std < 1e-8] = 1.0
+
+        X_raw, X_scalar = self._standardize(X_raw, X_scalar)
+
+        n_channels = X_raw.shape[1]
+        self._model = _HybridRawCNN.build(n_channels, scalar_dim, len(self.classes_), self.hidden_channels, self.dropout)
+
+        raw_tensor = torch.from_numpy(X_raw)
+        scalar_tensor = torch.from_numpy(X_scalar)
+        y_tensor = torch.from_numpy(y_idx)
+        dataset = torch.utils.data.TensorDataset(raw_tensor, scalar_tensor, y_tensor)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        optimizer = torch.optim.Adam(self._model.parameters(), lr=self.lr)
+        loss_fn = nn.CrossEntropyLoss()
+
+        self._model.train()
+        for _ in range(self.epochs):
+            for batch_raw, batch_scalar, batch_y in loader:
+                optimizer.zero_grad()
+                loss = loss_fn(self._forward(batch_raw, batch_scalar), batch_y)
+                loss.backward()
+                optimizer.step()
+
+        return self
+
+    def predict_proba(self, X_raw, X_scalar) -> np.ndarray:
+        import torch
+
+        X_raw = np.asarray(X_raw, dtype=np.float32)
+        if X_raw.ndim == 2:
+            X_raw = X_raw[np.newaxis, ...]
+        X_scalar = np.atleast_2d(np.asarray(X_scalar, dtype=np.float32))
+        if X_scalar.shape[0] != X_raw.shape[0]:
+            X_scalar = X_scalar.reshape(X_raw.shape[0], -1)
+        X_raw, X_scalar = self._standardize(X_raw, X_scalar)
+
+        self._model.eval()
+        with torch.no_grad():
+            logits = self._forward(torch.from_numpy(X_raw), torch.from_numpy(X_scalar))
+            proba = torch.softmax(logits, dim=1).numpy()
+        return proba
+
+    def predict(self, X_raw, X_scalar) -> np.ndarray:
+        proba = self.predict_proba(X_raw, X_scalar)
         indices = np.argmax(proba, axis=1)
         return np.array(self.classes_)[indices]
 
