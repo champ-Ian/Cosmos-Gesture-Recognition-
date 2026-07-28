@@ -46,7 +46,14 @@ from pathlib import Path
 
 import numpy as np
 
-from extract_features import feature_names_for_sensor, feature_names_for_sensors, extract_sensor_features
+from extract_features import (
+    extract_sensor_features,
+    extract_sensor_raw_sequence,
+    feature_names_for_sensor,
+    feature_names_for_sensors,
+    raw_feature_names_for_sensor,
+    raw_feature_names_for_sensors,
+)
 from gesture_models import LateFusionClassifier, build_classifier, classifier_label
 from sensors.common import MODELS_DIR, RESULTS_FIGURES_DIR, timestamp
 
@@ -71,6 +78,14 @@ def parse_args() -> argparse.Namespace:
         "--sensors",
         required=True,
         help="Comma-separated sensor subset to use, e.g. 'mmwave' or 'mmwave,imu,uwb'.",
+    )
+    parser.add_argument(
+        "--feature-mode",
+        choices=["summary", "raw"],
+        default="summary",
+        help="'summary' (default) = hand-engineered mean/std/etc. 'raw' = fixed-length resampled "
+        "raw sequences (see extract_features.py's RAW_SEQUENCE_STEPS). Must match how --features-csv "
+        "was exported (export_features_csv.py's --feature-mode).",
     )
     parser.add_argument("--fusion", choices=["early", "late"], default="early", help="How to combine multiple sensors.")
     parser.add_argument("--classifier", choices=["knn", "svm_linear", "cnn", "random_forest"], default="knn")
@@ -159,7 +174,7 @@ def read_manifests(dataset_dirs: list[Path]) -> tuple[list[dict], list[str]]:
     return rows, missing
 
 
-def read_features_csv(path: Path, sensors: list[str]) -> tuple[dict, list, list, list, list]:
+def read_features_csv(path: Path, sensors: list[str], feature_mode: str = "summary") -> tuple[dict, list, list, list, list]:
     """Load a flat feature table from `export_features_csv.py`.
 
     Returns the same shape `build_examples()` does --
@@ -168,7 +183,14 @@ def read_features_csv(path: Path, sensors: list[str]) -> tuple[dict, list, list,
     slices (columns are laid out sensor-by-sensor, in `--sensors` order, by
     `feature_names_for_sensors`), so both early and late fusion work the same
     as training from raw datasets.
+
+    `feature_mode="raw"` expects the raw resampled-sequence columns
+    (`export_features_csv.py --feature-mode raw`'s output, e.g.
+    `processed_signals.csv`) instead of the hand-engineered summary stats.
     """
+    names_for_sensors = raw_feature_names_for_sensors if feature_mode == "raw" else feature_names_for_sensors
+    names_for_sensor = raw_feature_names_for_sensor if feature_mode == "raw" else feature_names_for_sensor
+
     with path.open(newline="") as f:
         reader = csv.reader(f)
         header = next(reader, None)
@@ -180,14 +202,15 @@ def read_features_csv(path: Path, sensors: list[str]) -> tuple[dict, list, list,
                 f"{path} doesn't look like an export_features_csv.py output "
                 f"(expected first columns gesture,collector,source_dataset,session_dir, got {meta_cols})."
             )
-        expected_cols = feature_names_for_sensors(sensors)
+        expected_cols = names_for_sensors(sensors)
         if feature_cols != expected_cols:
             raise SystemExit(
-                f"{path}'s feature columns don't match --sensors {','.join(sensors)}. "
-                "Pass the same --sensors (same subset, same order) used with export_features_csv.py."
+                f"{path}'s feature columns don't match --sensors {','.join(sensors)} in --feature-mode "
+                f"{feature_mode}. Pass the same --sensors (same subset, same order) and matching "
+                "--feature-mode used with export_features_csv.py."
             )
 
-        sensor_lengths = {sensor: len(feature_names_for_sensor(sensor)) for sensor in sensors}
+        sensor_lengths = {sensor: len(names_for_sensor(sensor)) for sensor in sensors}
 
         per_sensor_examples: dict[str, list] = {sensor: [] for sensor in sensors}
         labels: list[str] = []
@@ -331,13 +354,18 @@ def main() -> int:
     if args.features_csv:
         dataset_dirs: list[Path] = []
         features_csv_path = Path(args.features_csv).expanduser().resolve()
-        per_sensor_examples, labels, collectors, sources, session_dirs = read_features_csv(features_csv_path, sensors)
+        per_sensor_examples, labels, collectors, sources, session_dirs = read_features_csv(
+            features_csv_path, sensors, args.feature_mode
+        )
     else:
         dataset_dirs = [Path(item).expanduser().resolve() for item in args.datasets]
         rows, missing_datasets = read_manifests(dataset_dirs)
         if not rows:
             raise SystemExit("No trials found. Expected trials.csv or trial_metadata.json files.")
-        per_sensor_examples, labels, collectors, sources, session_dirs, skipped = build_examples(rows, sensors)
+        extractor = extract_sensor_raw_sequence if args.feature_mode == "raw" else extract_sensor_features
+        per_sensor_examples, labels, collectors, sources, session_dirs, skipped = build_examples(
+            rows, sensors, feature_extractor=extractor
+        )
 
     if skipped:
         reason_counts: dict[str, int] = {}
@@ -403,7 +431,7 @@ def main() -> int:
         )
         model.fit(X_train, y_train)
         predictions = model.predict(X_test)
-        feature_names = feature_names_for_sensors(sensors)
+        feature_names = raw_feature_names_for_sensors(sensors) if args.feature_mode == "raw" else feature_names_for_sensors(sensors)
     else:
         sensor_models = {}
         classifier_params = {}
@@ -428,7 +456,8 @@ def main() -> int:
             classifier_params[sensor] = params
         model = LateFusionClassifier(sensor_models, sensors)
         predictions = model.predict(per_sensor_X_test)
-        feature_names = {sensor: feature_names_for_sensor(sensor) for sensor in sensors}
+        names_for_sensor = raw_feature_names_for_sensor if args.feature_mode == "raw" else feature_names_for_sensor
+        feature_names = {sensor: names_for_sensor(sensor) for sensor in sensors}
 
     accuracy = float(accuracy_score(y_test, predictions))
     labels_order = sorted(set(y))

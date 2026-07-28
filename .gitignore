@@ -24,4 +24,6 @@ logs/
 *.log
 *.npz
 *.confusion.png
+*.joblib
+*.json
 raw/
