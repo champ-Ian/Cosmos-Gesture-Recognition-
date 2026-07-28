@@ -23,6 +23,5 @@ sessions/
 logs/
 *.log
 *.npz
-*.joblib
 *.confusion.png
 raw/
