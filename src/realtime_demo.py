@@ -103,8 +103,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             "'interval' (default) predicts every --step-seconds regardless of what's happening -- "
             "windows constantly straddle real gesture boundaries. 'trigger' instead watches a cheap "
-            "motion-activity signal and only captures+classifies once it spikes above an idle "
-            "baseline, so the window is roughly gesture-bounded like training data was."
+            "motion-activity signal and only starts capturing once it spikes above an idle baseline, "
+            "so the capture is roughly gesture-bounded like training data was; once triggered, it "
+            "still predicts every --step-seconds on the growing window (not silent until the end)."
         ),
     )
     parser.add_argument(
@@ -637,9 +638,24 @@ def main() -> int:
                             if gui_queue is not None:
                                 gui_queue.put({"_status": "capturing..."})
                             capture_end = trigger_time + args.window_seconds
-                            while time.monotonic() < capture_end:
+                            # Predict every --step-seconds on a *growing* window (trigger_time ->
+                            # now) while the capture fills, instead of silently waiting for the
+                            # full --window-seconds with zero output -- early reads will be
+                            # low-confidence/no_gesture (barely any of the gesture has streamed in
+                            # yet), and firm up into the real answer as more data arrives, same
+                            # idea as autocomplete. Each read still reaches the GUI via gui_queue
+                            # the same way (capture_and_classify pushes it), so the live view
+                            # updates continuously too, not just at the end.
+                            last_rolling_time = 0.0
+                            while time.monotonic() < capture_end and not stop_event.is_set():
+                                rolling_now = time.monotonic()
+                                if rolling_now - last_rolling_time >= args.step_seconds:
+                                    capture_and_classify(window_start=trigger_time, window_end=rolling_now, **cycle_kwargs)
+                                    last_rolling_time = rolling_now
                                 time.sleep(0.02)
-                            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
+                            # Guaranteed final read over the complete intended window, regardless
+                            # of whether a rolling read happened to land exactly on capture_end.
+                            capture_and_classify(window_start=trigger_time, window_end=capture_end, **cycle_kwargs)
                             cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
                             if gui_queue is not None:
                                 gui_queue.put({"_status": "waiting for gesture..."})
