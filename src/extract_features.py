@@ -93,6 +93,37 @@ def remove_outliers(values: np.ndarray, window: int = 5, threshold: float = 3.5)
     return cleaned
 
 
+def smooth_signal(values: np.ndarray, window: int = 3) -> np.ndarray:
+    """Centered moving-average smoothing for residual per-sample sensor noise.
+
+    Complements `remove_outliers()` rather than replacing it: the Hampel filter above
+    only catches rare large spikes, it leaves ordinary small jitter/noise untouched --
+    this reduces that, on every sample, without needing an extra dependency (no scipy
+    in this project) for something a small window mean already does well enough at
+    these sample rates and trial lengths.
+    """
+    values = np.asarray(values, dtype=float).ravel()
+    n = len(values)
+    if n < 2 or window <= 1:
+        return values.copy()
+
+    half = window // 2
+    smoothed = np.empty(n, dtype=float)
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        smoothed[i] = np.mean(values[lo:hi])
+    return smoothed
+
+
+def clean_signal(values: np.ndarray, outlier_window: int = 5, outlier_threshold: float = 3.5, smooth_window: int = 3) -> np.ndarray:
+    """`remove_outliers()` then `smooth_signal()` -- the standard per-channel cleaning
+    used by every sensor extractor below, in both the offline cut step and realtime_demo.py.
+    """
+    return smooth_signal(
+        remove_outliers(values, window=outlier_window, threshold=outlier_threshold), window=smooth_window
+    )
+
+
 def _summary_stats(values: np.ndarray, prefix: str) -> tuple[list[float], list[str]]:
     """count/mean/std/min/max/first/last/delta -- reused across sensors."""
     values = _finite(values)
@@ -144,10 +175,10 @@ def extract_mmwave_features(npz) -> list[float] | None:
 
     range_profile = npz["mmwave_range_profile"]
     energy = np.nansum(range_profile, axis=1) if range_profile.size else np.zeros(frame_count)
-    energy = remove_outliers(energy)
+    energy = clean_signal(energy)
 
-    point_count = remove_outliers(npz["mmwave_point_count"].astype(float))
-    velocity = remove_outliers(_finite(npz["mmwave_points_velocity"]))
+    point_count = clean_signal(npz["mmwave_point_count"].astype(float))
+    velocity = clean_signal(_finite(npz["mmwave_points_velocity"]))
 
     features = [float(frame_count)]
     features += [
@@ -203,7 +234,7 @@ def extract_uwb_features(npz) -> list[float] | None:
     values = values[np.isfinite(values) & (values > 0) & (values < 60000)]
     if len(values) < 2:
         return None
-    values = remove_outliers(values)
+    values = clean_signal(values)
 
     diffs = np.diff(values)
     q25, q75 = np.percentile(values, [25, 75])
@@ -266,14 +297,14 @@ def parse_imu_line(line: str) -> tuple[float, float, float, float, float, float]
 
 def _parse_imu_lines(raw_lines) -> np.ndarray:
     """Parse `accel[g] ... | gyro[dps] ...` lines into an (n, 6) [ax,ay,az,gx,gy,gz] array,
-    with obvious per-axis outliers (bad packets/glitches) cleaned via `remove_outliers()`."""
+    with each axis cleaned (outliers removed, then smoothed) via `clean_signal()`."""
     rows = [parse_imu_line(line) for line in raw_lines]
     rows = [row for row in rows if row is not None]
     if not rows:
         return np.zeros((0, 6))
     samples = np.array(rows, dtype=float)
     for axis_index in range(samples.shape[1]):
-        samples[:, axis_index] = remove_outliers(samples[:, axis_index])
+        samples[:, axis_index] = clean_signal(samples[:, axis_index])
     return samples
 
 
@@ -375,7 +406,7 @@ def extract_rfid_features(npz) -> list[float] | None:
         return None
 
     tag_ids = {epc for epc, _, _ in records}
-    rssi = remove_outliers(np.array([rssi for _, rssi, _ in records], dtype=float))
+    rssi = clean_signal(np.array([rssi for _, rssi, _ in records], dtype=float))
     read_count_sum = float(sum(read_count for _, _, read_count in records))
 
     return [
@@ -480,8 +511,8 @@ def extract_mmwave_raw_sequence(npz) -> list[float] | None:
     range_profile = npz["mmwave_range_profile"]
     energy = np.nansum(range_profile, axis=1) if range_profile.size else np.zeros(frame_count)
     point_count = npz["mmwave_point_count"].astype(float)
-    energy_seq = _resample_to_fixed_length(time_s, remove_outliers(energy), RAW_SEQUENCE_STEPS)
-    points_seq = _resample_to_fixed_length(time_s, remove_outliers(point_count), RAW_SEQUENCE_STEPS)
+    energy_seq = _resample_to_fixed_length(time_s, clean_signal(energy), RAW_SEQUENCE_STEPS)
+    points_seq = _resample_to_fixed_length(time_s, clean_signal(point_count), RAW_SEQUENCE_STEPS)
     return [float(v) for v in np.concatenate([energy_seq, points_seq])]
 
 
@@ -508,7 +539,7 @@ def extract_imu_raw_sequence(npz) -> list[float] | None:
     samples_array = np.array(samples, dtype=float)
     sequences = [
         _resample_to_fixed_length(
-            times_array, remove_outliers(samples_array[:, axis_index]), RAW_SEQUENCE_STEPS
+            times_array, clean_signal(samples_array[:, axis_index]), RAW_SEQUENCE_STEPS
         )
         for axis_index in range(6)
     ]
@@ -532,7 +563,7 @@ def extract_uwb_raw_sequence(npz) -> list[float] | None:
     times = times[finite_mask]
     if len(values) < 2:
         return None
-    return [float(v) for v in _resample_to_fixed_length(times, remove_outliers(values), RAW_SEQUENCE_STEPS)]
+    return [float(v) for v in _resample_to_fixed_length(times, clean_signal(values), RAW_SEQUENCE_STEPS)]
 
 
 UWB_RAW_FEATURE_NAMES = [f"uwb_raw_distance_{i}" for i in range(RAW_SEQUENCE_STEPS)]
@@ -552,7 +583,7 @@ def extract_rfid_raw_sequence(npz) -> list[float] | None:
             rssi_values.append(float(parsed[1]))
     if len(rssi_values) < 2:
         return None
-    rssi_cleaned = remove_outliers(np.array(rssi_values, dtype=float))
+    rssi_cleaned = clean_signal(np.array(rssi_values, dtype=float))
     return [
         float(v)
         for v in _resample_to_fixed_length(np.array(times, dtype=float), rssi_cleaned, RAW_SEQUENCE_STEPS)
