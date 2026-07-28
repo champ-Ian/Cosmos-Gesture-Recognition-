@@ -39,6 +39,47 @@ def _finite(values: np.ndarray) -> np.ndarray:
     return values[np.isfinite(values)]
 
 
+def remove_outliers(values: np.ndarray, window: int = 5, threshold: float = 3.5) -> np.ndarray:
+    """Replace obvious spikes with the interpolated value between the nearest good
+    samples before/after (exactly their average, for an isolated single-sample spike).
+
+    Used identically by the offline `cut` step (so `train.py` trains on cleaned data)
+    and `realtime_demo.py` (which calls the same `extract_*_features()` on live
+    windows) -- one implementation, so both paths treat outliers the same way.
+
+    A point is "obviously" an outlier if it's far from the median of its local
+    neighborhood relative to that neighborhood's own spread (MAD, i.e. a Hampel
+    filter) -- local + robust so it doesn't flag legitimate gesture motion, which
+    moves the whole neighborhood together rather than spiking one sample.
+    """
+    values = np.asarray(values, dtype=float).ravel()
+    n = len(values)
+    if n < 3:
+        return values.copy()
+
+    is_outlier = np.zeros(n, dtype=bool)
+    for i in range(n):
+        lo, hi = max(0, i - window), min(n, i + window + 1)
+        neighborhood = np.delete(values[lo:hi], i - lo)
+        if len(neighborhood) == 0:
+            continue
+        median = np.median(neighborhood)
+        mad_scale = 1.4826 * np.median(np.abs(neighborhood - median))
+        if mad_scale == 0:
+            continue  # flat neighborhood -- nothing "obvious" to flag
+        if abs(values[i] - median) > threshold * mad_scale:
+            is_outlier[i] = True
+
+    if not is_outlier.any() or is_outlier.all():
+        return values.copy()
+
+    good_idx = np.flatnonzero(~is_outlier)
+    bad_idx = np.flatnonzero(is_outlier)
+    cleaned = values.copy()
+    cleaned[bad_idx] = np.interp(bad_idx, good_idx, values[good_idx])
+    return cleaned
+
+
 def _summary_stats(values: np.ndarray, prefix: str) -> tuple[list[float], list[str]]:
     """count/mean/std/min/max/first/last/delta -- reused across sensors."""
     values = _finite(values)
@@ -88,9 +129,10 @@ def extract_mmwave_features(npz) -> list[float] | None:
 
     range_profile = npz["mmwave_range_profile"]
     energy = np.nansum(range_profile, axis=1) if range_profile.size else np.zeros(frame_count)
+    energy = remove_outliers(energy)
 
-    point_count = npz["mmwave_point_count"].astype(float)
-    velocity = _finite(npz["mmwave_points_velocity"])
+    point_count = remove_outliers(npz["mmwave_point_count"].astype(float))
+    velocity = remove_outliers(_finite(npz["mmwave_points_velocity"]))
 
     features = [float(frame_count)]
     features += [
@@ -144,6 +186,7 @@ def extract_uwb_features(npz) -> list[float] | None:
     values = values[np.isfinite(values) & (values > 0) & (values < 60000)]
     if len(values) < 2:
         return None
+    values = remove_outliers(values)
 
     diffs = np.diff(values)
     q25, q75 = np.percentile(values, [25, 75])
@@ -205,10 +248,16 @@ def parse_imu_line(line: str) -> tuple[float, float, float, float, float, float]
 
 
 def _parse_imu_lines(raw_lines) -> np.ndarray:
-    """Parse `accel[g] ... | gyro[dps] ...` lines into an (n, 6) [ax,ay,az,gx,gy,gz] array."""
+    """Parse `accel[g] ... | gyro[dps] ...` lines into an (n, 6) [ax,ay,az,gx,gy,gz] array,
+    with obvious per-axis outliers (bad packets/glitches) cleaned via `remove_outliers()`."""
     rows = [parse_imu_line(line) for line in raw_lines]
     rows = [row for row in rows if row is not None]
-    return np.array(rows, dtype=float) if rows else np.zeros((0, 6))
+    if not rows:
+        return np.zeros((0, 6))
+    samples = np.array(rows, dtype=float)
+    for axis_index in range(samples.shape[1]):
+        samples[:, axis_index] = remove_outliers(samples[:, axis_index])
+    return samples
 
 
 def extract_imu_features(npz) -> list[float] | None:
@@ -305,7 +354,7 @@ def extract_rfid_features(npz) -> list[float] | None:
         return None
 
     tag_ids = {epc for epc, _, _ in records}
-    rssi = np.array([rssi for _, rssi, _ in records], dtype=float)
+    rssi = remove_outliers(np.array([rssi for _, rssi, _ in records], dtype=float))
     read_count_sum = float(sum(read_count for _, _, read_count in records))
 
     return [
@@ -408,8 +457,8 @@ def extract_mmwave_raw_sequence(npz) -> list[float] | None:
     range_profile = npz["mmwave_range_profile"]
     energy = np.nansum(range_profile, axis=1) if range_profile.size else np.zeros(frame_count)
     point_count = npz["mmwave_point_count"].astype(float)
-    energy_seq = _resample_to_fixed_length(time_s, energy, RAW_SEQUENCE_STEPS)
-    points_seq = _resample_to_fixed_length(time_s, point_count, RAW_SEQUENCE_STEPS)
+    energy_seq = _resample_to_fixed_length(time_s, remove_outliers(energy), RAW_SEQUENCE_STEPS)
+    points_seq = _resample_to_fixed_length(time_s, remove_outliers(point_count), RAW_SEQUENCE_STEPS)
     return [float(v) for v in np.concatenate([energy_seq, points_seq])]
 
 
@@ -433,7 +482,9 @@ def extract_imu_raw_sequence(npz) -> list[float] | None:
     times_array = np.array(times, dtype=float)
     samples_array = np.array(samples, dtype=float)
     sequences = [
-        _resample_to_fixed_length(times_array, samples_array[:, axis_index], RAW_SEQUENCE_STEPS)
+        _resample_to_fixed_length(
+            times_array, remove_outliers(samples_array[:, axis_index]), RAW_SEQUENCE_STEPS
+        )
         for axis_index in range(6)
     ]
     return [float(v) for v in np.concatenate(sequences)]
@@ -454,7 +505,7 @@ def extract_uwb_raw_sequence(npz) -> list[float] | None:
     times = times[finite_mask]
     if len(values) < 2:
         return None
-    return [float(v) for v in _resample_to_fixed_length(times, values, RAW_SEQUENCE_STEPS)]
+    return [float(v) for v in _resample_to_fixed_length(times, remove_outliers(values), RAW_SEQUENCE_STEPS)]
 
 
 UWB_RAW_FEATURE_NAMES = [f"uwb_raw_distance_{i}" for i in range(RAW_SEQUENCE_STEPS)]
@@ -472,9 +523,10 @@ def extract_rfid_raw_sequence(npz) -> list[float] | None:
             rssi_values.append(float(parsed[1]))
     if len(rssi_values) < 2:
         return None
+    rssi_cleaned = remove_outliers(np.array(rssi_values, dtype=float))
     return [
         float(v)
-        for v in _resample_to_fixed_length(np.array(times, dtype=float), np.array(rssi_values, dtype=float), RAW_SEQUENCE_STEPS)
+        for v in _resample_to_fixed_length(np.array(times, dtype=float), rssi_cleaned, RAW_SEQUENCE_STEPS)
     ]
 
 
