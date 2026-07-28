@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 train.py --help)",
+      "Bash(python3 export_features_csv.py --help)",
+      "Bash(python3 -c \"import realtime_demo; print\\('import OK'\\)\")",
+      "Bash(python3 realtime_demo.py --help)"
     ]
   }
 }
