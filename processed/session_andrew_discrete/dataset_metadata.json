@@ -1,0 +1,11 @@
+{
+  "collector": "andrew",
+  "created_at": "20260728_111913",
+  "dataset_name": "session_andrew_discrete",
+  "input_type": "cosmos_multi_sensor_gesture",
+  "row_count": 80,
+  "segment_length_s": 3.0,
+  "segment_stride_s": 3.0,
+  "skipped": [],
+  "source_session": "../raw/session_andrew_discrete"
+}

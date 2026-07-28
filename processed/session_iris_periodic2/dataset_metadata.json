@@ -1,0 +1,11 @@
+{
+  "collector": "iris",
+  "created_at": "20260728_111917",
+  "dataset_name": "session_iris_periodic2",
+  "input_type": "cosmos_multi_sensor_gesture",
+  "row_count": 12,
+  "segment_length_s": 3.0,
+  "segment_stride_s": 3.0,
+  "skipped": [],
+  "source_session": "../raw/session_iris_periodic2"
+}

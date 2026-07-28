@@ -1,0 +1,192 @@
+{
+  "accuracy": 0.9866666666666667,
+  "channel_names": [
+    "imu_ax",
+    "imu_ay",
+    "imu_az",
+    "imu_gx",
+    "imu_gy",
+    "imu_gz",
+    "mmwave_energy",
+    "mmwave_points",
+    "uwb_distance"
+  ],
+  "class_counts": {
+    "anti_clockwise": 72,
+    "bye_bye": 80,
+    "clapping": 90,
+    "clockwise": 72,
+    "fist_open": 80,
+    "left": 80,
+    "one_arm_boxing": 72,
+    "palm_up_down": 90,
+    "pull": 72,
+    "push": 72,
+    "raise_arms": 80,
+    "right": 80,
+    "soli": 90,
+    "t_arm": 80,
+    "two_arm_boxing": 90
+  },
+  "classification_report": {
+    "accuracy": 0.9866666666666667,
+    "anti_clockwise": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 18.0
+    },
+    "bye_bye": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 20.0
+    },
+    "clapping": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 23.0
+    },
+    "clockwise": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 18.0
+    },
+    "fist_open": {
+      "f1-score": 0.926829268292683,
+      "precision": 0.9047619047619048,
+      "recall": 0.95,
+      "support": 20.0
+    },
+    "left": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 20.0
+    },
+    "macro avg": {
+      "f1-score": 0.9864831825807435,
+      "precision": 0.9869167869167869,
+      "recall": 0.9862289562289562,
+      "support": 300.0
+    },
+    "one_arm_boxing": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 18.0
+    },
+    "palm_up_down": {
+      "f1-score": 0.9545454545454546,
+      "precision": 0.9545454545454546,
+      "recall": 0.9545454545454546,
+      "support": 22.0
+    },
+    "pull": {
+      "f1-score": 0.9444444444444444,
+      "precision": 0.9444444444444444,
+      "recall": 0.9444444444444444,
+      "support": 18.0
+    },
+    "push": {
+      "f1-score": 0.9714285714285714,
+      "precision": 1.0,
+      "recall": 0.9444444444444444,
+      "support": 18.0
+    },
+    "raise_arms": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 20.0
+    },
+    "right": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 20.0
+    },
+    "soli": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 23.0
+    },
+    "t_arm": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 20.0
+    },
+    "two_arm_boxing": {
+      "f1-score": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "support": 22.0
+    },
+    "weighted avg": {
+      "f1-score": 0.9867409988385598,
+      "precision": 0.986984126984127,
+      "recall": 0.9866666666666667,
+      "support": 300.0
+    }
+  },
+  "classifier": "cnn_raw",
+  "classifier_label": "1D-CNN (raw sequences)",
+  "classifier_params": {
+    "batch_size": 16,
+    "dropout": 0.3,
+    "epochs": 200,
+    "hidden_channels": 32,
+    "lr": 0.001,
+    "random_state": 42
+  },
+  "confusion_matrix": "/Users/tylerchen/Cosmos-Gesture-Recognition-/results/figures/cnn_raw_20260728_112640_confusion_matrix.png",
+  "features_csv": "/Users/tylerchen/Cosmos-Gesture-Recognition-/src/features_all_both.csv",
+  "model": "/Users/tylerchen/Cosmos-Gesture-Recognition-/models/cnn_raw_20260728_112640.joblib",
+  "n_examples": 1200,
+  "n_scalar_features": 58,
+  "n_test": 300,
+  "n_train": 900,
+  "per_class_recall": {
+    "anti_clockwise": 1.0,
+    "bye_bye": 1.0,
+    "clapping": 1.0,
+    "clockwise": 1.0,
+    "fist_open": 0.95,
+    "left": 1.0,
+    "one_arm_boxing": 1.0,
+    "palm_up_down": 0.9545454545454546,
+    "pull": 0.9444444444444444,
+    "push": 0.9444444444444444,
+    "raise_arms": 1.0,
+    "right": 1.0,
+    "soli": 1.0,
+    "t_arm": 1.0,
+    "two_arm_boxing": 1.0
+  },
+  "raw_length": 20,
+  "split_method": "random",
+  "test_collectors": [
+    "andrew",
+    "brandon",
+    "iris",
+    "leudies",
+    "peter",
+    "student1",
+    "tyler",
+    "vibha"
+  ],
+  "train_collectors": [
+    "andrew",
+    "brandon",
+    "iris",
+    "leudies",
+    "peter",
+    "student1",
+    "tyler",
+    "vibha"
+  ]
+}
