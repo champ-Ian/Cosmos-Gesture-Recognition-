@@ -451,8 +451,13 @@ def main() -> int:
     )
     confusion_out.parent.mkdir(parents=True, exist_ok=True)
     display = ConfusionMatrixDisplay(confusion_matrix=matrix, display_labels=labels_order)
-    fig, ax = plt.subplots(figsize=(6, 5))
-    display.plot(ax=ax, cmap="Blues", colorbar=False, xticks_rotation=45)
+    fig, ax = plt.subplots(figsize=(9, 8))
+    display.plot(ax=ax, cmap="Blues", colorbar=False)
+    # xticks_rotation alone leaves labels un-anchored to their tick, so rotated text
+    # drifts away from the column it belongs to -- ha="right" + rotation_mode="anchor"
+    # pins the label's right edge to the tick instead.
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    ax.tick_params(axis="both", labelsize=8)
     ax.set_title(
         f"{classifier_label(args.classifier)} ({args.fusion} fusion: {'+'.join(sensors)})\nAccuracy: {accuracy:.3f}"
     )
