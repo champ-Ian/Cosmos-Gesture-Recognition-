@@ -465,6 +465,11 @@ def capture_and_classify(
                 "prediction": display_prediction,
                 "confidence": display_confidence,
                 "time_s": window_end - session_start,
+                "raw_prediction": raw_prediction,
+                "raw_confidence": raw_confidence,
+                "below_threshold": below_threshold,
+                "vote_fraction": vote_fraction,
+                "vote_window": args.vote_window,
             }
         )
 
@@ -673,7 +678,11 @@ def main() -> int:
         worker = threading.Thread(target=lambda: result.update(interrupted=run_session()), daemon=True)
         worker.start()
         gui = RealtimeGestureGUI(
-            model_label=classifier_label, sensors=sensors, gesture_labels=labels, no_gesture_label=NO_GESTURE_LABEL
+            model_label=classifier_label,
+            sensors=sensors,
+            gesture_labels=labels,
+            no_gesture_label=NO_GESTURE_LABEL,
+            duration_s=args.duration,
         )
         gui.run(gui_queue, stop_event)
         worker.join(timeout=5)
