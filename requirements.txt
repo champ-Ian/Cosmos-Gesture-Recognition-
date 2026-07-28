@@ -2,6 +2,7 @@ numpy
 pyserial
 matplotlib
 scikit-learn
+torch
 
 # uwb/uwb-qorvo-tools (Qorvo FiRa TWR CLI, vendored from UWB_lab)
 colorama

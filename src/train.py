@@ -7,7 +7,7 @@ single sensor gives you the "single-sensor baseline" the project rubric
 asks for; multiple sensors gives you the "fused model" to compare against
 it), a fusion strategy (`--fusion early|late`, see the project spec's
 Fusion type table), and a classifier to compare against another run
-(`--classifier knn|svm_linear`).
+(`--classifier knn|svm_linear|cnn`).
 
 `--features stats` (default) uses hand-engineered summary-stat features
 (mean/std/energy/etc, see extract_features.py). `--features raw` instead
@@ -55,17 +55,33 @@ ALL_SENSORS = ("mmwave", "imu", "uwb", "rfid")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("datasets", nargs="+", help="Processed dataset folders from extract_features.py cut / combine_datasets.py.")
+    parser.add_argument(
+        "datasets",
+        nargs="*",
+        help="Processed dataset folders from extract_features.py cut / combine_datasets.py. "
+        "Omit if using --features-csv instead.",
+    )
+    parser.add_argument(
+        "--features-csv",
+        help="Train directly from a flat feature table exported by export_features_csv.py, instead of "
+        "re-extracting features from --datasets. Mutually exclusive with the `datasets` positional args. "
+        "--sensors must match what export_features_csv.py was run with (same subset, same order).",
+    )
     parser.add_argument(
         "--sensors",
         required=True,
         help="Comma-separated sensor subset to use, e.g. 'mmwave' or 'mmwave,imu,uwb'.",
     )
     parser.add_argument("--fusion", choices=["early", "late"], default="early", help="How to combine multiple sensors.")
-    parser.add_argument("--classifier", choices=["knn", "svm_linear"], default="knn")
+    parser.add_argument("--classifier", choices=["knn", "svm_linear", "cnn"], default="knn")
     parser.add_argument("--svm-c", type=float, default=1.0)
     parser.add_argument("--knn-neighbors", type=int, default=5)
     parser.add_argument("--knn-weights", choices=["uniform", "distance"], default="distance")
+    parser.add_argument("--cnn-epochs", type=int, default=200, help="Training epochs for --classifier cnn.")
+    parser.add_argument("--cnn-lr", type=float, default=1e-3, help="Adam learning rate for --classifier cnn.")
+    parser.add_argument("--cnn-hidden-channels", type=int, default=32, help="Conv1d channel width for --classifier cnn.")
+    parser.add_argument("--cnn-dropout", type=float, default=0.3, help="Dropout before the final layer for --classifier cnn.")
+    parser.add_argument("--cnn-batch-size", type=int, default=16, help="Batch size for --classifier cnn.")
     parser.add_argument("--test-size", type=float, default=0.25)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument(
@@ -139,6 +155,62 @@ def read_manifests(dataset_dirs: list[Path]) -> tuple[list[dict], list[str]]:
             item["_source_dataset"] = source_name
             rows.append(item)
     return rows, missing
+
+
+def read_features_csv(path: Path, sensors: list[str]) -> tuple[dict, list, list, list, list]:
+    """Load a flat feature table from `export_features_csv.py`.
+
+    Returns the same shape `build_examples()` does --
+    (per_sensor_examples, labels, collectors, sources, session_dirs) -- by
+    splitting each row's early-fusion feature vector back into per-sensor
+    slices (columns are laid out sensor-by-sensor, in `--sensors` order, by
+    `feature_names_for_sensors`), so both early and late fusion work the same
+    as training from raw datasets.
+    """
+    with path.open(newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None:
+            raise SystemExit(f"{path} is empty.")
+        meta_cols, feature_cols = header[:4], header[4:]
+        if meta_cols != ["gesture", "collector", "source_dataset", "session_dir"]:
+            raise SystemExit(
+                f"{path} doesn't look like an export_features_csv.py output "
+                f"(expected first columns gesture,collector,source_dataset,session_dir, got {meta_cols})."
+            )
+        expected_cols = feature_names_for_sensors(sensors)
+        if feature_cols != expected_cols:
+            raise SystemExit(
+                f"{path}'s feature columns don't match --sensors {','.join(sensors)}. "
+                "Pass the same --sensors (same subset, same order) used with export_features_csv.py."
+            )
+
+        sensor_lengths = {sensor: len(feature_names_for_sensor(sensor)) for sensor in sensors}
+
+        per_sensor_examples: dict[str, list] = {sensor: [] for sensor in sensors}
+        labels: list[str] = []
+        collectors: list[str] = []
+        sources: list[str] = []
+        session_dirs: list[str] = []
+
+        for row in reader:
+            if not row:
+                continue
+            gesture, collector, source, session_dir = row[:4]
+            values = [float(v) for v in row[4:]]
+            offset = 0
+            for sensor in sensors:
+                length = sensor_lengths[sensor]
+                per_sensor_examples[sensor].append(values[offset : offset + length])
+                offset += length
+            labels.append(gesture)
+            collectors.append(collector)
+            sources.append(source)
+            session_dirs.append(session_dir)
+
+    if not labels:
+        raise SystemExit(f"No rows found in {path}.")
+    return per_sensor_examples, labels, collectors, sources, session_dirs
 
 
 def resolve_path(dataset_dir: Path, value: str, default: Path) -> Path:
@@ -247,12 +319,24 @@ def default_model_path(classifier: str, fusion: str, sensors: list[str]) -> Path
 def main() -> int:
     args = parse_args()
     sensors = normalize_sensor_list(args.sensors)
-    dataset_dirs = [Path(item).expanduser().resolve() for item in args.datasets]
-    rows, missing_datasets = read_manifests(dataset_dirs)
-    if not rows:
-        raise SystemExit("No trials found. Expected trials.csv or trial_metadata.json files.")
 
-    per_sensor_examples, labels, collectors, sources, session_dirs, skipped = build_examples(rows, sensors)
+    if bool(args.datasets) == bool(args.features_csv):
+        raise SystemExit("Pass either `datasets` (processed dataset folders) or --features-csv, not both/neither.")
+
+    missing_datasets: list[str] = []
+    skipped: list[dict] = []
+
+    if args.features_csv:
+        dataset_dirs: list[Path] = []
+        features_csv_path = Path(args.features_csv).expanduser().resolve()
+        per_sensor_examples, labels, collectors, sources, session_dirs = read_features_csv(features_csv_path, sensors)
+    else:
+        dataset_dirs = [Path(item).expanduser().resolve() for item in args.datasets]
+        rows, missing_datasets = read_manifests(dataset_dirs)
+        if not rows:
+            raise SystemExit("No trials found. Expected trials.csv or trial_metadata.json files.")
+        per_sensor_examples, labels, collectors, sources, session_dirs, skipped = build_examples(rows, sensors)
+
     if skipped:
         reason_counts: dict[str, int] = {}
         for entry in skipped:
@@ -307,6 +391,11 @@ def main() -> int:
             args.svm_c,
             args.knn_neighbors,
             args.knn_weights,
+            args.cnn_epochs,
+            args.cnn_lr,
+            args.cnn_hidden_channels,
+            args.cnn_dropout,
+            args.cnn_batch_size,
         )
         model.fit(X_train, y_train)
         predictions = model.predict(X_test)
@@ -322,6 +411,11 @@ def main() -> int:
                 args.svm_c,
                 args.knn_neighbors,
                 args.knn_weights,
+                args.cnn_epochs,
+                args.cnn_lr,
+                args.cnn_hidden_channels,
+                args.cnn_dropout,
+                args.cnn_batch_size,
             )
             sub_model.fit(per_sensor_X_train[sensor], y_train)
             sensor_models[sensor] = sub_model
@@ -346,7 +440,7 @@ def main() -> int:
         "classifier_label": classifier_label(args.classifier),
         "classifier_params": classifier_params,
         "labels": labels_order,
-        "training_datasets": [str(path) for path in dataset_dirs],
+        "training_datasets": [str(path) for path in dataset_dirs] if dataset_dirs else [str(Path(args.features_csv).expanduser().resolve())],
         "split_method": split_method,
         "test_collectors": test_collectors_used,
     }
@@ -371,7 +465,7 @@ def main() -> int:
         for i, label in enumerate(labels_order)
     }
     summary = {
-        "datasets": [str(path) for path in dataset_dirs],
+        "datasets": [str(path) for path in dataset_dirs] if dataset_dirs else [str(Path(args.features_csv).expanduser().resolve())],
         "sensors": sensors,
         "fusion": args.fusion,
         "classifier": args.classifier,
