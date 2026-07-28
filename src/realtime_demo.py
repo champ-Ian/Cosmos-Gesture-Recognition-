@@ -33,7 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
-from extract_features import extract_sensor_features, feature_names_for_sensor
+from extract_features import extract_sensor_features
 from sensors.common import REPO_DIR, timestamp
 from sensors.imu_reader import ImuReader
 from sensors.mmwave_reader import MmwaveReader
@@ -43,38 +43,6 @@ from sensors.uwb_reader import UwbReader
 # Resolved relative to this file (src/), not the current working directory --
 # see collect.py's DEFAULT_MMWAVE_CFG for why.
 DEFAULT_MMWAVE_CFG = Path(__file__).resolve().parent / "mmwave" / "xwrL64xx-evm" / "near_field_hand_50cm.cfg"
-
-# ---------------------------------------------------------------------------
-# Rest / "not a gesture" detection -- a rule-based gate, not a trained class.
-#
-# Each of these features (already computed by extract_sensor_features(), same
-# as what the classifier sees) is ~0 when nothing is moving and grows with
-# real motion. If every active sensor's value stays under its threshold, we
-# report REST_LABEL directly and skip the classifier entirely for that step.
-# ---------------------------------------------------------------------------
-
-REST_LABEL = "resting"
-
-REST_MOTION_FEATURES = {
-    "imu": ["imu_accel_mag_std", "imu_gx_std", "imu_gy_std", "imu_gz_std"],
-    "mmwave": ["mmwave_velocity_abs_mean", "mmwave_point_count_std"],
-    "uwb": ["uwb_mean_abs_step_cm"],
-}
-
-# Ballpark fallback thresholds, used when --rest-calibration-seconds is 0 (or
-# too short to produce a usable baseline). --rest-calibration-seconds (the
-# default) measures your own hardware's noise floor instead and is more
-# reliable across different kits/people -- treat these as a rough safety net,
-# not the intended source of truth.
-DEFAULT_REST_THRESHOLDS = {
-    "imu_accel_mag_std": 0.06,
-    "imu_gx_std": 5.0,
-    "imu_gy_std": 5.0,
-    "imu_gz_std": 5.0,
-    "mmwave_velocity_abs_mean": 0.05,
-    "mmwave_point_count_std": 2.0,
-    "uwb_mean_abs_step_cm": 1.5,
-}
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,30 +59,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
-
-    rest_group = parser.add_argument_group(
-        "Rest / no-gesture detection (rule-based gate, not a trained class -- see REST_MOTION_FEATURES)"
-    )
-    rest_group.add_argument(
-        "--no-rest-detection",
-        action="store_true",
-        help="Disable rest detection entirely -- always classify into one of the trained gestures.",
-    )
-    rest_group.add_argument(
-        "--rest-calibration-seconds",
-        type=float,
-        default=2.0,
-        help=(
-            "Seconds to hold still at startup to calibrate rest thresholds from this hardware's own "
-            "noise floor (recommended). Set to 0 to skip calibration and use fixed built-in defaults."
-        ),
-    )
-    rest_group.add_argument(
-        "--rest-threshold-multiplier",
-        type=float,
-        default=4.0,
-        help="Calibrated threshold = baseline_mean + multiplier * baseline_std, per motion feature.",
-    )
 
     mmwave_group = parser.add_argument_group("mmWave radar (TI xWRL6432)")
     mmwave_group.add_argument("--mmwave-port")
@@ -227,87 +171,6 @@ def window_to_feature_input(sensor: str, window) -> dict:
     raise ValueError(f"Unknown sensor: {sensor}")
 
 
-def sensor_rest_ratio(sensor: str, feature_vector: list[float], thresholds: dict[str, float]) -> float | None:
-    """Max(|feature value| / threshold) over this sensor's configured motion features.
-
-    >1 means this sensor alone shows enough motion to rule out "resting". None if this
-    sensor has no configured motion features (e.g. rfid) -- it's simply not consulted.
-    """
-    feature_names = REST_MOTION_FEATURES.get(sensor)
-    if not feature_names:
-        return None
-    names = feature_names_for_sensor(sensor)
-    ratios = []
-    for feat in feature_names:
-        value = abs(feature_vector[names.index(feat)])
-        threshold = thresholds.get(feat, DEFAULT_REST_THRESHOLDS[feat])
-        ratios.append((value / threshold) if threshold > 0 else (0.0 if value == 0 else float("inf")))
-    return max(ratios)
-
-
-def is_at_rest(sensors: list[str], per_sensor_vectors: dict, thresholds: dict[str, float]) -> bool:
-    """True if every sensor with configured motion features reports staying under threshold."""
-    ratios = [
-        ratio
-        for sensor in sensors
-        if (ratio := sensor_rest_ratio(sensor, per_sensor_vectors[sensor], thresholds)) is not None
-    ]
-    return bool(ratios) and max(ratios) <= 1.0
-
-
-def calibrate_rest_thresholds(
-    streams: dict,
-    calibration_seconds: float,
-    multiplier: float,
-    window_seconds: float,
-    step_seconds: float,
-) -> dict[str, float]:
-    """Sample motion features while the user holds still to derive per-hardware rest thresholds.
-
-    Falls back to DEFAULT_REST_THRESHOLDS per feature if calibration is skipped (0s) or a
-    feature never got enough samples (e.g. that sensor isn't in `streams`).
-    """
-    if calibration_seconds <= 0:
-        return dict(DEFAULT_REST_THRESHOLDS)
-
-    print(f"Calibrating rest baseline -- hold your hands still for {calibration_seconds:.1f}s...")
-    samples: dict[str, list[float]] = {feat: [] for feats in REST_MOTION_FEATURES.values() for feat in feats}
-
-    start = time.monotonic()
-    end = start + calibration_seconds
-    next_sample = start
-    while time.monotonic() < end:
-        now = time.monotonic()
-        if now >= next_sample:
-            for sensor, stream in streams.items():
-                feats = REST_MOTION_FEATURES.get(sensor)
-                if not feats:
-                    continue
-                window = stream.window(max(start, now - window_seconds), now)
-                vector = extract_sensor_features(sensor, window_to_feature_input(sensor, window))
-                if vector is None:
-                    continue
-                names = feature_names_for_sensor(sensor)
-                for feat in feats:
-                    samples[feat].append(vector[names.index(feat)])
-            next_sample = now + step_seconds
-        time.sleep(0.02)
-
-    thresholds: dict[str, float] = {}
-    for feat, values in samples.items():
-        default = DEFAULT_REST_THRESHOLDS[feat]
-        if len(values) < 2:
-            thresholds[feat] = default
-            continue
-        arr = np.array(values)
-        calibrated = float(np.mean(arr) + multiplier * np.std(arr))
-        # A near-perfectly-still calibration take (std ~ 0) shouldn't make the gate trip on
-        # ordinary sensor noise later -- never let calibration set the bar below half the default.
-        thresholds[feat] = max(calibrated, 0.5 * default)
-    print("Rest calibration done:", {k: round(v, 4) for k, v in thresholds.items()})
-    return thresholds
-
-
 def prediction_confidence(model, sensors: list[str], fusion: str, per_sensor_vectors: dict, prediction: str) -> float | None:
     if fusion == "early":
         vector = []
@@ -366,13 +229,6 @@ def main() -> int:
     streams = open_streams(args, sensors, session_dir)
     time.sleep(0.5)  # let boards start producing data
 
-    rest_thresholds = None
-    if not args.no_rest_detection:
-        rest_thresholds = calibrate_rest_thresholds(
-            streams, args.rest_calibration_seconds, args.rest_threshold_multiplier,
-            args.window_seconds, args.step_seconds,
-        )
-
     vote_history: deque = deque(maxlen=args.vote_window)
     interrupted = False
 
@@ -416,10 +272,7 @@ def main() -> int:
                         per_sensor_vectors[sensor] = vector
 
                     if ready:
-                        if rest_thresholds is not None and is_at_rest(sensors, per_sensor_vectors, rest_thresholds):
-                            raw_prediction, raw_confidence = REST_LABEL, None
-                        else:
-                            raw_prediction, raw_confidence = predict(model, sensors, fusion, per_sensor_vectors)
+                        raw_prediction, raw_confidence = predict(model, sensors, fusion, per_sensor_vectors)
                         vote_history.append(raw_prediction)
                         if args.vote_window <= 1:
                             display_prediction, display_confidence = raw_prediction, raw_confidence
