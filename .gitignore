@@ -20,8 +20,6 @@ env/
 data/
 datasets/
 sessions/
-models/
-results/
 logs/
 *.log
 *.npz
