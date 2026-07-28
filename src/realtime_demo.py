@@ -23,6 +23,11 @@ real gesture label even during transitions/idle time. This is a stopgap, not
 a substitute for training on an actual idle/no-gesture class; it just keeps
 low-confidence guesses from being reported as if they were real detections.
 
+Also handles models from `train_cnn_raw.py` (`payload["classifier"] ==
+"cnn_raw"`) -- those need resampled raw per-channel sequences, not the flat
+summary-stat vector every other model here uses, so window extraction and
+prediction both branch on that instead of assuming one shape everywhere.
+
 Example (run from the repo root; a model trained on mmWave + IMU):
 
     python src/realtime_demo.py \\
@@ -43,12 +48,19 @@ from pathlib import Path
 
 import numpy as np
 
-from extract_features import extract_sensor_features
+from extract_features import (
+    RAW_SEQUENCE_STEPS,
+    extract_sensor_features,
+    extract_sensor_raw_sequence,
+    feature_names_for_sensor,
+    raw_feature_names_for_sensor,
+)
 from sensors.common import REPO_DIR, timestamp
 from sensors.imu_reader import ImuReader
 from sensors.mmwave_reader import MmwaveReader
 from sensors.rfid_reader import RfidReader
 from sensors.uwb_reader import UwbReader
+from train_cnn_raw import RAW_COLUMN_RE
 
 # Resolved relative to this file (src/), not the current working directory --
 # see collect.py's DEFAULT_MMWAVE_CFG for why.
@@ -194,6 +206,66 @@ def window_to_feature_input(sensor: str, window) -> dict:
     raise ValueError(f"Unknown sensor: {sensor}")
 
 
+def window_to_raw_input(sensor: str, window) -> dict:
+    """Same idea as `window_to_feature_input`, but for `extract_sensor_raw_sequence`
+    (train_cnn_raw.py's raw-resampled-sequence path) instead of `extract_sensor_features`.
+    That extractor needs per-sample *timestamps* too (it resamples onto a fixed grid),
+    which the scalar path never needed -- every reader's `.window()` already returns
+    them, `window_to_feature_input` just didn't pass them through."""
+    if sensor == "mmwave":
+        return {
+            "mmwave_frame_number": window["frame_number"],
+            "mmwave_time_s": window["time_s"],
+            "mmwave_range_profile": window["range_profile"],
+            "mmwave_point_count": window["point_count"],
+        }
+    if sensor == "uwb":
+        return {
+            "uwb_status": window["status"],
+            "uwb_distance_cm": window["distance_cm"],
+            "uwb_time_s": window["time_s"],
+        }
+    if sensor in ("imu", "rfid"):
+        return {
+            f"{sensor}_raw_lines": np.array([line for _, line in window], dtype=object),
+            f"{sensor}_recv_time_s": np.array([t for t, _ in window], dtype=float),
+        }
+    raise ValueError(f"Unknown sensor: {sensor}")
+
+
+def raw_channel_sequences(sensor: str, raw_input: dict) -> dict[str, list[float]]:
+    """Extract one sensor's raw resampled sequence and regroup it by channel key
+    (e.g. 'imu_ax', matching `train_cnn_raw.py`'s `channel_names`) instead of the
+    flat per-step names `raw_feature_names_for_sensor` returns (e.g. 'imu_raw_ax_0').
+    Returns {} if this sensor's raw sequence can't be extracted from this window."""
+    values = extract_sensor_raw_sequence(sensor, raw_input)
+    if values is None:
+        return {}
+    names = raw_feature_names_for_sensor(sensor)
+    channels: dict[str, list[float]] = {}
+    for name, value in zip(names, values):
+        match = RAW_COLUMN_RE.match(name)
+        if not match:
+            continue
+        sensor_name, field, step = match.group(1), match.group(2), int(match.group(3))
+        channel_key = f"{sensor_name}_{field}"
+        channels.setdefault(channel_key, [0.0] * RAW_SEQUENCE_STEPS)[step] = value
+    return channels
+
+
+def predict_raw(model, channel_names: list[str], scalar_names: list[str], channel_seqs: dict, scalar_values: dict) -> tuple[str, float | None]:
+    """`predict()`'s equivalent for `TorchRawCNNClassifier` models -- these take
+    `(X_raw, X_scalar)` as two separate structured arrays instead of one flat
+    vector, so they can't share `predict()`/`prediction_confidence()` above."""
+    X_raw = np.array([[channel_seqs[channel] for channel in channel_names]], dtype=np.float32)
+    X_scalar = np.array([[scalar_values[name] for name in scalar_names]], dtype=np.float32)
+    prediction = model.predict(X_raw, X_scalar)[0]
+    proba = model.predict_proba(X_raw, X_scalar)[0]
+    classes = list(model.classes_)
+    confidence = float(proba[classes.index(prediction)]) if prediction in classes else float(max(proba))
+    return prediction, confidence
+
+
 def prediction_confidence(model, sensors: list[str], fusion: str, per_sensor_vectors: dict, prediction: str) -> float | None:
     if fusion == "early":
         vector = []
@@ -235,17 +307,29 @@ def main() -> int:
 
     payload = joblib.load(args.model)
     model = payload["model"]
-    sensors = payload["sensors"]
-    fusion = payload.get("fusion", "early")
     classifier_label = payload.get("classifier_label", payload.get("classifier", "unknown"))
     labels = payload.get("labels", [])
+    is_raw_cnn = payload.get("classifier") == "cnn_raw"
+
+    if is_raw_cnn:
+        channel_names = payload["channel_names"]
+        scalar_names = payload["scalar_names"]
+        # channel/scalar names are '{sensor}_{field}' / '{sensor}_{stat}' -- the
+        # sensor is always the part before the first underscore (sensor names
+        # themselves never contain one), same convention train_cnn_raw.py uses.
+        sensors = sorted({name.split("_", 1)[0] for name in channel_names + scalar_names})
+        fusion = None
+        print(f"Loaded model: {classifier_label} (raw sequences + summary stats: {'+'.join(sensors)})")
+    else:
+        sensors = payload["sensors"]
+        fusion = payload.get("fusion", "early")
+        print(f"Loaded model: {classifier_label} ({fusion} fusion: {'+'.join(sensors)})")
 
     session_name = args.session_name or f"eval_{timestamp()}"
     session_dir = Path(args.out_root).expanduser().resolve() / session_name
     session_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = session_dir / "realtime_predictions.csv"
 
-    print(f"Loaded model: {classifier_label} ({fusion} fusion: {'+'.join(sensors)})")
     print(f"Gesture labels: {', '.join(labels)}")
     print(f"Session folder: {session_dir}")
 
@@ -286,18 +370,35 @@ def main() -> int:
 
                 if now - last_prediction_time >= args.step_seconds:
                     window_start = max(session_start, now - args.window_seconds)
-                    per_sensor_vectors = {}
                     ready = True
-                    for sensor, stream in streams.items():
-                        window = stream.window(window_start, now)
-                        vector = extract_sensor_features(sensor, window_to_feature_input(sensor, window))
-                        if vector is None:
-                            ready = False
-                            break
-                        per_sensor_vectors[sensor] = vector
+
+                    if is_raw_cnn:
+                        channel_seqs: dict = {}
+                        scalar_values: dict = {}
+                        for sensor, stream in streams.items():
+                            window = stream.window(window_start, now)
+                            sensor_channels = raw_channel_sequences(sensor, window_to_raw_input(sensor, window))
+                            scalar_vector = extract_sensor_features(sensor, window_to_feature_input(sensor, window))
+                            if not sensor_channels or scalar_vector is None:
+                                ready = False
+                                break
+                            channel_seqs.update(sensor_channels)
+                            scalar_values.update(zip(feature_names_for_sensor(sensor), scalar_vector))
+                    else:
+                        per_sensor_vectors = {}
+                        for sensor, stream in streams.items():
+                            window = stream.window(window_start, now)
+                            vector = extract_sensor_features(sensor, window_to_feature_input(sensor, window))
+                            if vector is None:
+                                ready = False
+                                break
+                            per_sensor_vectors[sensor] = vector
 
                     if ready:
-                        raw_prediction, raw_confidence = predict(model, sensors, fusion, per_sensor_vectors)
+                        if is_raw_cnn:
+                            raw_prediction, raw_confidence = predict_raw(model, channel_names, scalar_names, channel_seqs, scalar_values)
+                        else:
+                            raw_prediction, raw_confidence = predict(model, sensors, fusion, per_sensor_vectors)
                         below_threshold = raw_confidence is not None and raw_confidence < args.confidence_threshold
                         gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
                         vote_history.append(gated_prediction)
