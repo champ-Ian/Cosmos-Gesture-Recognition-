@@ -49,7 +49,7 @@ def _has_sensor_data(npz, marker_key: str) -> bool:
     (return None, let the caller skip the trial) instead of a raw KeyError that would
     otherwise crash a whole train.py/export_features_csv.py run over one bad trial.
     """
-    return marker_key in npz.files
+    return marker_key in npz
 
 
 def remove_outliers(values: np.ndarray, window: int = 5, threshold: float = 3.5) -> np.ndarray:
