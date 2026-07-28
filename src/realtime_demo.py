@@ -14,13 +14,23 @@ Only pass the `--*-port` flags for sensors your model actually uses --
 `train.py --sensors` records which ones that is, and this script tells you
 plainly if a required port is missing.
 
+`--confidence-threshold` (default 0.5) rejects low-confidence raw predictions
+before they reach display/voting/logging, replacing them with `"no_gesture"`.
+This exists because live sliding windows constantly straddle real gesture
+boundaries (unlike training, which only ever sees precisely trial-bounded
+windows) -- without a threshold, the model is forced to confidently guess a
+real gesture label even during transitions/idle time. This is a stopgap, not
+a substitute for training on an actual idle/no-gesture class; it just keeps
+low-confidence guesses from being reported as if they were real detections.
+
 Example (run from the repo root; a model trained on mmWave + IMU):
 
     python src/realtime_demo.py \\
       --model models/knn_early_mmwave-imu_20260101_120000.joblib \\
       --mmwave-port /dev/cu.usbserial-XXXX \\
       --imu-port /dev/cu.usbserial-YYYY \\
-      --duration 60 --window-seconds 3 --step-seconds 0.5 --vote-window 5
+      --duration 60 --window-seconds 3 --step-seconds 0.5 --vote-window 5 \\
+      --confidence-threshold 0.5
 """
 from __future__ import annotations
 
@@ -44,6 +54,10 @@ from sensors.uwb_reader import UwbReader
 # see collect.py's DEFAULT_MMWAVE_CFG for why.
 DEFAULT_MMWAVE_CFG = Path(__file__).resolve().parent / "mmwave" / "xwrL64xx-evm" / "near_field_hand_50cm.cfg"
 
+# Stand-in label for predictions below --confidence-threshold. Not a real
+# trained class -- no model ever outputs this from .predict() itself.
+NO_GESTURE_LABEL = "no_gesture"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -56,6 +70,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Majority-vote over this many recent raw predictions. 1 = show raw predictions.",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Predictions with confidence below this are reported as 'no_gesture' instead of the "
+            "raw guess -- see the module docstring. Set to 0 to disable (always show the raw guess)."
+        ),
     )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
@@ -241,6 +264,8 @@ def main() -> int:
                 "confidence",
                 "raw_prediction",
                 "raw_confidence",
+                "gated_prediction",
+                "confidence_threshold",
                 "vote_fraction",
                 "vote_count",
                 "vote_window",
@@ -273,9 +298,11 @@ def main() -> int:
 
                     if ready:
                         raw_prediction, raw_confidence = predict(model, sensors, fusion, per_sensor_vectors)
-                        vote_history.append(raw_prediction)
+                        below_threshold = raw_confidence is not None and raw_confidence < args.confidence_threshold
+                        gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
+                        vote_history.append(gated_prediction)
                         if args.vote_window <= 1:
-                            display_prediction, display_confidence = raw_prediction, raw_confidence
+                            display_prediction, display_confidence = gated_prediction, raw_confidence
                             vote_fraction, vote_counts = None, {}
                         else:
                             display_prediction, vote_fraction, vote_counts = majority_vote(vote_history)
@@ -288,6 +315,8 @@ def main() -> int:
                                 "confidence": "" if display_confidence is None else f"{display_confidence:.4f}",
                                 "raw_prediction": raw_prediction,
                                 "raw_confidence": "" if raw_confidence is None else f"{raw_confidence:.4f}",
+                                "gated_prediction": gated_prediction,
+                                "confidence_threshold": args.confidence_threshold,
                                 "vote_fraction": "" if vote_fraction is None else f"{vote_fraction:.4f}",
                                 "vote_count": len(vote_history),
                                 "vote_window": args.vote_window,
@@ -297,7 +326,8 @@ def main() -> int:
                         prediction_file.flush()
                         if args.vote_window <= 1:
                             conf_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
-                            print(f"prediction: {display_prediction}{conf_text}", flush=True)
+                            below_text = f" [below {args.confidence_threshold:.2f}, raw guess: {raw_prediction}]" if below_threshold else ""
+                            print(f"prediction: {display_prediction}{conf_text}{below_text}", flush=True)
                         else:
                             vote_text = "" if vote_fraction is None else f" vote={vote_fraction:.2f}"
                             raw_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
