@@ -39,6 +39,19 @@ def _finite(values: np.ndarray) -> np.ndarray:
     return values[np.isfinite(values)]
 
 
+def _has_sensor_data(npz, marker_key: str) -> bool:
+    """True if `npz` actually has this sensor's payload -- `cut_session()` writes a
+    sensor's keys all together or not at all, so one marker key stands in for the rest.
+
+    A trial's `sensors_enabled` manifest column can disagree with what's actually in
+    its `trial_data.npz` (e.g. the raw session never had that sensor's data at all,
+    despite the column claiming it did) -- treat that the same as "not enough data"
+    (return None, let the caller skip the trial) instead of a raw KeyError that would
+    otherwise crash a whole train.py/export_features_csv.py run over one bad trial.
+    """
+    return marker_key in npz.files
+
+
 def remove_outliers(values: np.ndarray, window: int = 5, threshold: float = 3.5) -> np.ndarray:
     """Replace obvious spikes with the interpolated value between the nearest good
     samples before/after (exactly their average, for an isolated single-sample spike).
@@ -122,6 +135,8 @@ MMWAVE_FEATURE_NAMES = [
 
 
 def extract_mmwave_features(npz) -> list[float] | None:
+    if not _has_sensor_data(npz, "mmwave_frame_number"):
+        return None
     frame_number = npz["mmwave_frame_number"]
     frame_count = len(frame_number)
     if frame_count == 0:
@@ -176,6 +191,8 @@ def extract_uwb_features(npz) -> list[float] | None:
     to split per anchor) -- that's a deliberate baseline simplification, not
     a claim that anchor identity doesn't matter for your gestures.
     """
+    if not _has_sensor_data(npz, "uwb_status"):
+        return None
     status = npz["uwb_status"]
     distance_cm = npz["uwb_distance_cm"]
     if len(distance_cm) == 0:
@@ -266,6 +283,8 @@ def extract_imu_features(npz) -> list[float] | None:
     If your group's firmware prints something else, update `_IMU_SAMPLE_RE`
     (or write your own extractor and register it in FEATURE_SPECS).
     """
+    if not _has_sensor_data(npz, "imu_raw_lines"):
+        return None
     raw_lines = npz["imu_raw_lines"]
     line_count = len(raw_lines)
     if line_count == 0:
@@ -344,6 +363,8 @@ def extract_rfid_features(npz) -> list[float] | None:
     (e.g. one per finger for Soli-style sensing), filter `_parse_rfid_lines()`
     output by EPC first and compute per-tag features instead.
     """
+    if not _has_sensor_data(npz, "rfid_raw_lines"):
+        return None
     raw_lines = npz["rfid_raw_lines"]
     line_count = len(raw_lines)
     if line_count == 0:
@@ -450,6 +471,8 @@ def _resample_to_fixed_length(times: np.ndarray, values: np.ndarray, num_steps: 
 
 
 def extract_mmwave_raw_sequence(npz) -> list[float] | None:
+    if not _has_sensor_data(npz, "mmwave_frame_number"):
+        return None
     frame_count = len(npz["mmwave_frame_number"])
     if frame_count == 0:
         return None
@@ -468,6 +491,8 @@ MMWAVE_RAW_FEATURE_NAMES = [f"mmwave_raw_energy_{i}" for i in range(RAW_SEQUENCE
 
 
 def extract_imu_raw_sequence(npz) -> list[float] | None:
+    if not _has_sensor_data(npz, "imu_raw_lines"):
+        return None
     raw_lines = npz["imu_raw_lines"]
     recv_time_s = npz["imu_recv_time_s"]
     times: list[float] = []
@@ -494,6 +519,8 @@ IMU_RAW_FEATURE_NAMES = [f"imu_raw_{axis}_{i}" for axis in IMU_AXES for i in ran
 
 
 def extract_uwb_raw_sequence(npz) -> list[float] | None:
+    if not _has_sensor_data(npz, "uwb_status"):
+        return None
     status = npz["uwb_status"]
     distance_cm = npz["uwb_distance_cm"]
     time_s = npz["uwb_time_s"]
@@ -512,6 +539,8 @@ UWB_RAW_FEATURE_NAMES = [f"uwb_raw_distance_{i}" for i in range(RAW_SEQUENCE_STE
 
 
 def extract_rfid_raw_sequence(npz) -> list[float] | None:
+    if not _has_sensor_data(npz, "rfid_raw_lines"):
+        return None
     raw_lines = npz["rfid_raw_lines"]
     recv_time_s = npz["rfid_recv_time_s"]
     times: list[float] = []
