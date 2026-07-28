@@ -53,6 +53,8 @@ from extract_features import (
     extract_sensor_features,
     extract_sensor_raw_sequence,
     feature_names_for_sensor,
+    parse_imu_line,
+    parse_rfid_line,
     raw_feature_names_for_sensor,
 )
 from sensors.common import REPO_DIR, timestamp
@@ -91,6 +93,47 @@ def parse_args() -> argparse.Namespace:
             "Predictions with confidence below this are reported as 'no_gesture' instead of the "
             "raw guess -- see the module docstring. Set to 0 to disable (always show the raw guess)."
         ),
+    )
+    parser.add_argument(
+        "--capture-mode",
+        choices=["interval", "trigger"],
+        default="interval",
+        help=(
+            "'interval' (default) predicts every --step-seconds regardless of what's happening -- "
+            "windows constantly straddle real gesture boundaries. 'trigger' instead watches a cheap "
+            "motion-activity signal and only captures+classifies once it spikes above an idle "
+            "baseline, so the window is roughly gesture-bounded like training data was."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-seconds",
+        type=float,
+        default=2.0,
+        help="[trigger mode] Idle period at startup used to measure each sensor's resting activity level. Stay still.",
+    )
+    parser.add_argument(
+        "--trigger-window-seconds",
+        type=float,
+        default=0.4,
+        help="[trigger mode] Short lookback window used to compute the live activity signal.",
+    )
+    parser.add_argument(
+        "--trigger-check-interval",
+        type=float,
+        default=0.1,
+        help="[trigger mode] Seconds between activity-signal checks while waiting for a trigger.",
+    )
+    parser.add_argument(
+        "--trigger-z-threshold",
+        type=float,
+        default=3.0,
+        help="[trigger mode] Trigger when any sensor's activity is this many std-devs above its idle baseline.",
+    )
+    parser.add_argument(
+        "--trigger-cooldown-seconds",
+        type=float,
+        default=1.0,
+        help="[trigger mode] Minimum quiet time after a capture before a new trigger can fire.",
     )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
@@ -188,6 +231,38 @@ def close_streams(streams: dict) -> None:
             stream.close()
         except Exception as error:  # noqa: BLE001 - best-effort cleanup
             print(f"Warning: error while closing sensor: {error}")
+
+
+def sensor_activity_score(sensor: str, window) -> float | None:
+    """Cheap 'how much motion is in this window' number for trigger-mode --
+    NOT a feature vector, just a scalar used to decide whether to bother
+    capturing+classifying at all. Returns None if there's not enough data
+    in the window to say anything (treated as "no activity detected")."""
+    if sensor == "mmwave":
+        if len(window["frame_number"]) < 2:
+            return None
+        range_profile = window["range_profile"]
+        energy = np.nansum(range_profile, axis=1) if range_profile.size else np.zeros(len(window["frame_number"]))
+        return float(np.std(energy))
+    if sensor == "uwb":
+        ok = window["status"] == "Ok"
+        values = window["distance_cm"][ok]
+        if len(values) < 2:
+            return None
+        return float(np.std(values))
+    if sensor == "imu":
+        samples = [parse_imu_line(line) for _, line in window]
+        samples = [s for s in samples if s is not None]
+        if len(samples) < 2:
+            return None
+        accel_mag = np.linalg.norm(np.array(samples)[:, :3], axis=1)
+        return float(np.std(accel_mag))
+    if sensor == "rfid":
+        rssi = [parse_rfid_line(line)[1] for _, line in window if parse_rfid_line(line) is not None]
+        if len(rssi) < 2:
+            return None
+        return float(np.std(rssi))
+    raise ValueError(f"Unknown sensor: {sensor}")
 
 
 def window_to_feature_input(sensor: str, window) -> dict:
@@ -296,6 +371,141 @@ def predict(model, sensors: list[str], fusion: str, per_sensor_vectors: dict) ->
     return prediction, confidence
 
 
+def capture_and_classify(
+    streams: dict,
+    window_start: float,
+    window_end: float,
+    model,
+    sensors: list[str],
+    fusion: str | None,
+    is_raw_cnn: bool,
+    channel_names: list[str] | None,
+    scalar_names: list[str] | None,
+    args: argparse.Namespace,
+    vote_history: deque,
+    writer,
+    prediction_file,
+    session_start: float,
+) -> None:
+    """Extract features over [window_start, window_end], predict, gate on
+    --confidence-threshold, log to CSV, and print -- shared by both
+    --capture-mode interval (called every --step-seconds) and trigger
+    (called once per detected gesture onset). Does nothing if a sensor's
+    data in this window isn't usable (e.g. too few samples)."""
+    ready = True
+
+    if is_raw_cnn:
+        channel_seqs: dict = {}
+        scalar_values: dict = {}
+        for sensor, stream in streams.items():
+            window = stream.window(window_start, window_end)
+            sensor_channels = raw_channel_sequences(sensor, window_to_raw_input(sensor, window))
+            scalar_vector = extract_sensor_features(sensor, window_to_feature_input(sensor, window))
+            if not sensor_channels or scalar_vector is None:
+                ready = False
+                break
+            channel_seqs.update(sensor_channels)
+            scalar_values.update(zip(feature_names_for_sensor(sensor), scalar_vector))
+    else:
+        per_sensor_vectors = {}
+        for sensor, stream in streams.items():
+            window = stream.window(window_start, window_end)
+            vector = extract_sensor_features(sensor, window_to_feature_input(sensor, window))
+            if vector is None:
+                ready = False
+                break
+            per_sensor_vectors[sensor] = vector
+
+    if not ready:
+        return
+
+    if is_raw_cnn:
+        raw_prediction, raw_confidence = predict_raw(model, channel_names, scalar_names, channel_seqs, scalar_values)
+    else:
+        raw_prediction, raw_confidence = predict(model, sensors, fusion, per_sensor_vectors)
+    below_threshold = raw_confidence is not None and raw_confidence < args.confidence_threshold
+    gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
+    vote_history.append(gated_prediction)
+    if args.vote_window <= 1:
+        display_prediction, display_confidence = gated_prediction, raw_confidence
+        vote_fraction, vote_counts = None, {}
+    else:
+        display_prediction, vote_fraction, vote_counts = majority_vote(vote_history)
+        display_confidence = vote_fraction
+
+    writer.writerow(
+        {
+            "time_s": f"{window_end - session_start:.3f}",
+            "prediction": display_prediction,
+            "confidence": "" if display_confidence is None else f"{display_confidence:.4f}",
+            "raw_prediction": raw_prediction,
+            "raw_confidence": "" if raw_confidence is None else f"{raw_confidence:.4f}",
+            "gated_prediction": gated_prediction,
+            "confidence_threshold": args.confidence_threshold,
+            "vote_fraction": "" if vote_fraction is None else f"{vote_fraction:.4f}",
+            "vote_count": len(vote_history),
+            "vote_window": args.vote_window,
+            "vote_counts_json": json.dumps(vote_counts, sort_keys=True),
+        }
+    )
+    prediction_file.flush()
+
+    if args.vote_window <= 1:
+        conf_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
+        below_text = f" [below {args.confidence_threshold:.2f}, raw guess: {raw_prediction}]" if below_threshold else ""
+        print(f"prediction: {display_prediction}{conf_text}{below_text}", flush=True)
+    else:
+        vote_text = "" if vote_fraction is None else f" vote={vote_fraction:.2f}"
+        raw_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
+        print(f"prediction: {display_prediction}{vote_text} | raw: {raw_prediction}{raw_text}", flush=True)
+
+
+def calibrate_idle_baseline(streams: dict, args: argparse.Namespace) -> dict[str, tuple[float, float]]:
+    """[trigger mode] Sample each sensor's activity score for --calibration-seconds
+    (the tester should stay still) and return {sensor: (mean, std)}. This is the
+    idle baseline every later activity reading gets compared against to decide
+    whether a gesture just started."""
+    print(f"Calibrating idle baseline -- please stay still for {args.calibration_seconds:.1f}s...")
+    samples: dict[str, list[float]] = {sensor: [] for sensor in streams}
+    calibration_start = time.monotonic()
+    end_time = calibration_start + args.calibration_seconds
+    while time.monotonic() < end_time:
+        now = time.monotonic()
+        window_start = max(calibration_start, now - args.trigger_window_seconds)
+        for sensor, stream in streams.items():
+            score = sensor_activity_score(sensor, stream.window(window_start, now))
+            if score is not None:
+                samples[sensor].append(score)
+        time.sleep(args.trigger_check_interval)
+
+    baseline: dict[str, tuple[float, float]] = {}
+    for sensor, values in samples.items():
+        if values:
+            mean = float(np.mean(values))
+            std = max(float(np.std(values)), 1e-6)
+        else:
+            mean, std = 0.0, 1e-6
+        baseline[sensor] = (mean, std)
+    print("Baseline: " + ", ".join(f"{sensor}={mean:.2f}±{std:.2f}" for sensor, (mean, std) in baseline.items()))
+    return baseline
+
+
+def activity_triggered(streams: dict, baseline: dict[str, tuple[float, float]], now: float, args: argparse.Namespace) -> bool:
+    """[trigger mode] True if any sensor's current activity is --trigger-z-threshold
+    std-devs above its idle baseline -- deliberately liberal (any one sensor can
+    trigger) since missed real gestures are worse than an occasional false trigger
+    that gets caught by --confidence-threshold downstream instead."""
+    window_start = now - args.trigger_window_seconds
+    for sensor, stream in streams.items():
+        score = sensor_activity_score(sensor, stream.window(window_start, now))
+        if score is None:
+            continue
+        mean, std = baseline[sensor]
+        if (score - mean) / std >= args.trigger_z_threshold:
+            return True
+    return False
+
+
 def main() -> int:
     args = parse_args()
     args.vote_window = max(1, int(args.vote_window))
@@ -360,83 +570,55 @@ def main() -> int:
 
         session_start = time.monotonic()
         end_time = session_start + args.duration
-        last_prediction_time = 0.0
+
+        cycle_kwargs = dict(
+            streams=streams,
+            model=model,
+            sensors=sensors,
+            fusion=fusion,
+            is_raw_cnn=is_raw_cnn,
+            channel_names=channel_names if is_raw_cnn else None,
+            scalar_names=scalar_names if is_raw_cnn else None,
+            args=args,
+            vote_history=vote_history,
+            writer=writer,
+            prediction_file=prediction_file,
+            session_start=session_start,
+        )
 
         try:
-            while time.monotonic() < end_time:
-                now = time.monotonic()
-                for stream in streams.values():
-                    stream.check_error()
+            if args.capture_mode == "trigger":
+                baseline = calibrate_idle_baseline(streams, args)
+                print(f"Waiting for gesture onset (z >= {args.trigger_z_threshold})...")
+                cooldown_until = 0.0
+                while time.monotonic() < end_time:
+                    now = time.monotonic()
+                    for stream in streams.values():
+                        stream.check_error()
 
-                if now - last_prediction_time >= args.step_seconds:
-                    window_start = max(session_start, now - args.window_seconds)
-                    ready = True
+                    if now >= cooldown_until and activity_triggered(streams, baseline, now, args):
+                        trigger_time = now
+                        print(f"[{trigger_time - session_start:.2f}s] gesture onset detected, capturing...", flush=True)
+                        capture_end = trigger_time + args.window_seconds
+                        while time.monotonic() < capture_end:
+                            time.sleep(0.02)
+                        capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
+                        cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
 
-                    if is_raw_cnn:
-                        channel_seqs: dict = {}
-                        scalar_values: dict = {}
-                        for sensor, stream in streams.items():
-                            window = stream.window(window_start, now)
-                            sensor_channels = raw_channel_sequences(sensor, window_to_raw_input(sensor, window))
-                            scalar_vector = extract_sensor_features(sensor, window_to_feature_input(sensor, window))
-                            if not sensor_channels or scalar_vector is None:
-                                ready = False
-                                break
-                            channel_seqs.update(sensor_channels)
-                            scalar_values.update(zip(feature_names_for_sensor(sensor), scalar_vector))
-                    else:
-                        per_sensor_vectors = {}
-                        for sensor, stream in streams.items():
-                            window = stream.window(window_start, now)
-                            vector = extract_sensor_features(sensor, window_to_feature_input(sensor, window))
-                            if vector is None:
-                                ready = False
-                                break
-                            per_sensor_vectors[sensor] = vector
+                    time.sleep(args.trigger_check_interval)
+            else:
+                last_prediction_time = 0.0
+                while time.monotonic() < end_time:
+                    now = time.monotonic()
+                    for stream in streams.values():
+                        stream.check_error()
 
-                    if ready:
-                        if is_raw_cnn:
-                            raw_prediction, raw_confidence = predict_raw(model, channel_names, scalar_names, channel_seqs, scalar_values)
-                        else:
-                            raw_prediction, raw_confidence = predict(model, sensors, fusion, per_sensor_vectors)
-                        below_threshold = raw_confidence is not None and raw_confidence < args.confidence_threshold
-                        gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
-                        vote_history.append(gated_prediction)
-                        if args.vote_window <= 1:
-                            display_prediction, display_confidence = gated_prediction, raw_confidence
-                            vote_fraction, vote_counts = None, {}
-                        else:
-                            display_prediction, vote_fraction, vote_counts = majority_vote(vote_history)
-                            display_confidence = vote_fraction
+                    if now - last_prediction_time >= args.step_seconds:
+                        window_start = max(session_start, now - args.window_seconds)
+                        capture_and_classify(window_start=window_start, window_end=now, **cycle_kwargs)
+                        last_prediction_time = now
 
-                        writer.writerow(
-                            {
-                                "time_s": f"{now - session_start:.3f}",
-                                "prediction": display_prediction,
-                                "confidence": "" if display_confidence is None else f"{display_confidence:.4f}",
-                                "raw_prediction": raw_prediction,
-                                "raw_confidence": "" if raw_confidence is None else f"{raw_confidence:.4f}",
-                                "gated_prediction": gated_prediction,
-                                "confidence_threshold": args.confidence_threshold,
-                                "vote_fraction": "" if vote_fraction is None else f"{vote_fraction:.4f}",
-                                "vote_count": len(vote_history),
-                                "vote_window": args.vote_window,
-                                "vote_counts_json": json.dumps(vote_counts, sort_keys=True),
-                            }
-                        )
-                        prediction_file.flush()
-                        if args.vote_window <= 1:
-                            conf_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
-                            below_text = f" [below {args.confidence_threshold:.2f}, raw guess: {raw_prediction}]" if below_threshold else ""
-                            print(f"prediction: {display_prediction}{conf_text}{below_text}", flush=True)
-                        else:
-                            vote_text = "" if vote_fraction is None else f" vote={vote_fraction:.2f}"
-                            raw_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
-                            print(f"prediction: {display_prediction}{vote_text} | raw: {raw_prediction}{raw_text}", flush=True)
-
-                    last_prediction_time = now
-
-                time.sleep(0.02)
+                    time.sleep(0.02)
         except KeyboardInterrupt:
             interrupted = True
             print("\nInterrupted. Stopping sensors...")
