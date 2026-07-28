@@ -136,7 +136,15 @@ def parse_args() -> argparse.Namespace:
         "--trigger-cooldown-seconds",
         type=float,
         default=1.0,
-        help="[trigger mode] Minimum quiet time after a capture before a new trigger can fire.",
+        help="[trigger mode] If a motion episode never reaches --confidence-threshold, minimum "
+        "sustained-quiet time before falling back to idle ('no motion detected').",
+    )
+    parser.add_argument(
+        "--rest-seconds",
+        type=float,
+        default=1.0,
+        help="[trigger mode] Fixed pause after each confirmed/announced prediction, during which "
+        "'rest' is reported and motion detection is paused, before watching for the next gesture.",
     )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
@@ -380,7 +388,7 @@ def predict(model, sensors: list[str], fusion: str, per_sensor_vectors: dict) ->
     return prediction, confidence
 
 
-def capture_and_classify(
+def _classify_window(
     streams: dict,
     window_start: float,
     window_end: float,
@@ -390,18 +398,15 @@ def capture_and_classify(
     is_raw_cnn: bool,
     channel_names: list[str] | None,
     scalar_names: list[str] | None,
-    args: argparse.Namespace,
-    vote_history: deque,
-    writer,
-    prediction_file,
-    session_start: float,
-    gui_queue: "queue.Queue | None" = None,
-) -> None:
-    """Extract features over [window_start, window_end], predict, gate on
-    --confidence-threshold, log to CSV, and print -- shared by both
-    --capture-mode interval (called every --step-seconds) and trigger
-    (called once per detected gesture onset). Does nothing if a sensor's
-    data in this window isn't usable (e.g. too few samples)."""
+) -> tuple[str, float | None] | None:
+    """Extract features over [window_start, window_end] and predict -- no gating,
+    no logging, no printing, just (raw_prediction, raw_confidence). Returns None
+    if a sensor's data in this window isn't usable (e.g. too few samples).
+
+    Split out from `capture_and_classify` so trigger mode's state machine can
+    silently re-probe a growing window (every check interval, while waiting to
+    see if the model becomes confident) without spamming the console/CSV/GUI
+    the way an official, reported prediction does."""
     ready = True
 
     if is_raw_cnn:
@@ -427,12 +432,39 @@ def capture_and_classify(
             per_sensor_vectors[sensor] = vector
 
     if not ready:
-        return
+        return None
 
     if is_raw_cnn:
-        raw_prediction, raw_confidence = predict_raw(model, channel_names, scalar_names, channel_seqs, scalar_values)
-    else:
-        raw_prediction, raw_confidence = predict(model, sensors, fusion, per_sensor_vectors)
+        return predict_raw(model, channel_names, scalar_names, channel_seqs, scalar_values)
+    return predict(model, sensors, fusion, per_sensor_vectors)
+
+
+def capture_and_classify(
+    streams: dict,
+    window_start: float,
+    window_end: float,
+    model,
+    sensors: list[str],
+    fusion: str | None,
+    is_raw_cnn: bool,
+    channel_names: list[str] | None,
+    scalar_names: list[str] | None,
+    args: argparse.Namespace,
+    vote_history: deque,
+    writer,
+    prediction_file,
+    session_start: float,
+    gui_queue: "queue.Queue | None" = None,
+) -> None:
+    """Extract features over [window_start, window_end], predict, gate on
+    --confidence-threshold, log to CSV, and print -- shared by --capture-mode
+    interval (called every --step-seconds) and trigger (called once a motion
+    episode's classification is confirmed). Does nothing if a sensor's data in
+    this window isn't usable (e.g. too few samples)."""
+    result = _classify_window(streams, window_start, window_end, model, sensors, fusion, is_raw_cnn, channel_names, scalar_names)
+    if result is None:
+        return
+    raw_prediction, raw_confidence = result
     below_threshold = raw_confidence is not None and raw_confidence < args.confidence_threshold
     gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
     vote_history.append(gated_prediction)
@@ -530,6 +562,97 @@ def activity_triggered(streams: dict, baseline: dict[str, tuple[float, float]], 
     return False
 
 
+def run_trigger_state_machine(
+    streams: dict,
+    model,
+    sensors: list[str],
+    fusion: str | None,
+    is_raw_cnn: bool,
+    channel_names: list[str] | None,
+    scalar_names: list[str] | None,
+    args: argparse.Namespace,
+    end_time: float,
+    stop_event: threading.Event,
+    cycle_kwargs: dict,
+    gui_queue: "queue.Queue | None",
+) -> None:
+    """--capture-mode trigger's loop: a five-state cycle --
+
+        idle ("no motion detected")
+          -> motion ("motion detected")
+          -> once the model is confident, the actual gesture gets reported
+             (via `capture_and_classify`, so it's logged/printed/GUI-pushed
+             the normal way)
+          -> rest ("rest") -- a fixed --rest-seconds pause, motion detection
+             paused, before the next cycle can start
+          -> back to idle ("no motion detected")
+          -> repeat.
+
+    Each state gets its own distinct announcement. In the "motion" state,
+    `_classify_window` silently re-probes a window that grows from motion
+    onset up to --window-seconds wide (no CSV/print/GUI side effects per
+    probe) -- that's what lets the classification window roughly match the
+    gesture's actual length instead of guessing on a fixed timer the way
+    --capture-mode interval does. If a motion episode never reaches
+    --confidence-threshold, it falls back to idle once activity has been
+    quiet for --trigger-cooldown-seconds (no "rest" pause in that case --
+    rest is specifically the pause after a real, reported prediction).
+    """
+
+    def announce_status(text: str) -> None:
+        print(text, flush=True)
+        if gui_queue is not None:
+            gui_queue.put({"_status": text})
+
+    announce_status(f"calibrating -- stay still ({args.calibration_seconds:.0f}s)...")
+    baseline = calibrate_idle_baseline(streams, args)
+
+    state = "idle"
+    motion_start: float | None = None
+    quiet_since: float | None = None
+    rest_until: float | None = None
+
+    announce_status("no motion detected")
+
+    while time.monotonic() < end_time and not stop_event.is_set():
+        now = time.monotonic()
+        for stream in streams.values():
+            stream.check_error()
+
+        if state == "idle":
+            if activity_triggered(streams, baseline, now, args):
+                state = "motion"
+                motion_start = now
+                quiet_since = None
+                announce_status("motion detected")
+        elif state == "motion":
+            window_start = max(motion_start, now - args.window_seconds)
+            probe = _classify_window(streams, window_start, now, model, sensors, fusion, is_raw_cnn, channel_names, scalar_names)
+            if probe is not None:
+                _, probe_confidence = probe
+                if probe_confidence is not None and probe_confidence >= args.confidence_threshold:
+                    capture_and_classify(window_start=window_start, window_end=now, **cycle_kwargs)
+                    state = "rest"
+                    rest_until = now + args.rest_seconds
+                    announce_status("rest")
+
+            if state == "motion":  # still unconfirmed -- check whether it's settled back to quiet
+                if activity_triggered(streams, baseline, now, args):
+                    quiet_since = None
+                elif quiet_since is None:
+                    quiet_since = now
+                elif now - quiet_since >= args.trigger_cooldown_seconds:
+                    state = "idle"
+                    motion_start = None
+                    announce_status("no motion detected")
+        elif state == "rest":
+            if now >= rest_until:
+                state = "idle"
+                announce_status("no motion detected")
+
+        time.sleep(args.trigger_check_interval)
+
+
 def main() -> int:
     args = parse_args()
     args.vote_window = max(1, int(args.vote_window))
@@ -620,47 +743,20 @@ def main() -> int:
 
             try:
                 if args.capture_mode == "trigger":
-                    if gui_queue is not None:
-                        gui_queue.put({"_status": f"calibrating -- stay still ({args.calibration_seconds:.0f}s)..."})
-                    baseline = calibrate_idle_baseline(streams, args)
-                    print(f"Waiting for gesture onset (z >= {args.trigger_z_threshold})...")
-                    if gui_queue is not None:
-                        gui_queue.put({"_status": "waiting for gesture..."})
-                    cooldown_until = 0.0
-                    while time.monotonic() < end_time and not stop_event.is_set():
-                        now = time.monotonic()
-                        for stream in streams.values():
-                            stream.check_error()
-
-                        if now >= cooldown_until and activity_triggered(streams, baseline, now, args):
-                            trigger_time = now
-                            print(f"[{trigger_time - session_start:.2f}s] gesture onset detected, capturing...", flush=True)
-                            if gui_queue is not None:
-                                gui_queue.put({"_status": "capturing..."})
-                            capture_end = trigger_time + args.window_seconds
-                            # Predict every --step-seconds on a *growing* window (trigger_time ->
-                            # now) while the capture fills, instead of silently waiting for the
-                            # full --window-seconds with zero output -- early reads will be
-                            # low-confidence/no_gesture (barely any of the gesture has streamed in
-                            # yet), and firm up into the real answer as more data arrives, same
-                            # idea as autocomplete. Each read still reaches the GUI via gui_queue
-                            # the same way (capture_and_classify pushes it), so the live view
-                            # updates continuously too, not just at the end.
-                            last_rolling_time = 0.0
-                            while time.monotonic() < capture_end and not stop_event.is_set():
-                                rolling_now = time.monotonic()
-                                if rolling_now - last_rolling_time >= args.step_seconds:
-                                    capture_and_classify(window_start=trigger_time, window_end=rolling_now, **cycle_kwargs)
-                                    last_rolling_time = rolling_now
-                                time.sleep(0.02)
-                            # Guaranteed final read over the complete intended window, regardless
-                            # of whether a rolling read happened to land exactly on capture_end.
-                            capture_and_classify(window_start=trigger_time, window_end=capture_end, **cycle_kwargs)
-                            cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
-                            if gui_queue is not None:
-                                gui_queue.put({"_status": "waiting for gesture..."})
-
-                        time.sleep(args.trigger_check_interval)
+                    run_trigger_state_machine(
+                        streams=streams,
+                        model=model,
+                        sensors=sensors,
+                        fusion=fusion,
+                        is_raw_cnn=is_raw_cnn,
+                        channel_names=channel_names if is_raw_cnn else None,
+                        scalar_names=scalar_names if is_raw_cnn else None,
+                        args=args,
+                        end_time=end_time,
+                        stop_event=stop_event,
+                        cycle_kwargs=cycle_kwargs,
+                        gui_queue=gui_queue,
+                    )
                 else:
                     last_prediction_time = 0.0
                     while time.monotonic() < end_time and not stop_event.is_set():
