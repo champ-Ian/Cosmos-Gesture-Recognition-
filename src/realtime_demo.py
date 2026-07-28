@@ -42,6 +42,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import queue
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -137,6 +139,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Show a live Tkinter window (big color-coded prediction, confidence bar, "
+        "recent-prediction history) instead of terminal-only output.",
+    )
 
     mmwave_group = parser.add_argument_group("mmWave radar (TI xWRL6432)")
     mmwave_group.add_argument("--mmwave-port")
@@ -386,6 +394,7 @@ def capture_and_classify(
     writer,
     prediction_file,
     session_start: float,
+    gui_queue: "queue.Queue | None" = None,
 ) -> None:
     """Extract features over [window_start, window_end], predict, gate on
     --confidence-threshold, log to CSV, and print -- shared by both
@@ -449,6 +458,15 @@ def capture_and_classify(
         }
     )
     prediction_file.flush()
+
+    if gui_queue is not None:
+        gui_queue.put(
+            {
+                "prediction": display_prediction,
+                "confidence": display_confidence,
+                "time_s": window_end - session_start,
+            }
+        )
 
     if args.vote_window <= 1:
         conf_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
@@ -546,87 +564,122 @@ def main() -> int:
     streams = open_streams(args, sensors, session_dir)
     time.sleep(0.5)  # let boards start producing data
 
-    vote_history: deque = deque(maxlen=args.vote_window)
-    interrupted = False
+    stop_event = threading.Event()
+    gui_queue: "queue.Queue | None" = queue.Queue() if args.gui else None
 
-    with open(predictions_path, "w", newline="") as prediction_file:
-        writer = csv.DictWriter(
-            prediction_file,
-            fieldnames=[
-                "time_s",
-                "prediction",
-                "confidence",
-                "raw_prediction",
-                "raw_confidence",
-                "gated_prediction",
-                "confidence_threshold",
-                "vote_fraction",
-                "vote_count",
-                "vote_window",
-                "vote_counts_json",
-            ],
+    def run_session() -> bool:
+        """Runs the capture/predict loop until --duration elapses, a fatal
+        error occurs, or `stop_event` is set (only happens if --gui's window
+        gets closed early). Returns True if the session was interrupted."""
+        vote_history: deque = deque(maxlen=args.vote_window)
+        interrupted = False
+
+        with open(predictions_path, "w", newline="") as prediction_file:
+            writer = csv.DictWriter(
+                prediction_file,
+                fieldnames=[
+                    "time_s",
+                    "prediction",
+                    "confidence",
+                    "raw_prediction",
+                    "raw_confidence",
+                    "gated_prediction",
+                    "confidence_threshold",
+                    "vote_fraction",
+                    "vote_count",
+                    "vote_window",
+                    "vote_counts_json",
+                ],
+            )
+            writer.writeheader()
+
+            session_start = time.monotonic()
+            end_time = session_start + args.duration
+
+            cycle_kwargs = dict(
+                streams=streams,
+                model=model,
+                sensors=sensors,
+                fusion=fusion,
+                is_raw_cnn=is_raw_cnn,
+                channel_names=channel_names if is_raw_cnn else None,
+                scalar_names=scalar_names if is_raw_cnn else None,
+                args=args,
+                vote_history=vote_history,
+                writer=writer,
+                prediction_file=prediction_file,
+                session_start=session_start,
+                gui_queue=gui_queue,
+            )
+
+            try:
+                if args.capture_mode == "trigger":
+                    if gui_queue is not None:
+                        gui_queue.put({"_status": f"calibrating -- stay still ({args.calibration_seconds:.0f}s)..."})
+                    baseline = calibrate_idle_baseline(streams, args)
+                    print(f"Waiting for gesture onset (z >= {args.trigger_z_threshold})...")
+                    if gui_queue is not None:
+                        gui_queue.put({"_status": "waiting for gesture..."})
+                    cooldown_until = 0.0
+                    while time.monotonic() < end_time and not stop_event.is_set():
+                        now = time.monotonic()
+                        for stream in streams.values():
+                            stream.check_error()
+
+                        if now >= cooldown_until and activity_triggered(streams, baseline, now, args):
+                            trigger_time = now
+                            print(f"[{trigger_time - session_start:.2f}s] gesture onset detected, capturing...", flush=True)
+                            if gui_queue is not None:
+                                gui_queue.put({"_status": "capturing..."})
+                            capture_end = trigger_time + args.window_seconds
+                            while time.monotonic() < capture_end:
+                                time.sleep(0.02)
+                            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
+                            cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
+                            if gui_queue is not None:
+                                gui_queue.put({"_status": "waiting for gesture..."})
+
+                        time.sleep(args.trigger_check_interval)
+                else:
+                    last_prediction_time = 0.0
+                    while time.monotonic() < end_time and not stop_event.is_set():
+                        now = time.monotonic()
+                        for stream in streams.values():
+                            stream.check_error()
+
+                        if now - last_prediction_time >= args.step_seconds:
+                            window_start = max(session_start, now - args.window_seconds)
+                            capture_and_classify(window_start=window_start, window_end=now, **cycle_kwargs)
+                            last_prediction_time = now
+
+                        time.sleep(0.02)
+            except KeyboardInterrupt:
+                interrupted = True
+                print("\nInterrupted. Stopping sensors...")
+            except RuntimeError as error:
+                interrupted = True
+                print(f"\nEvaluation failed: {error}")
+            finally:
+                close_streams(streams)
+                if gui_queue is not None:
+                    gui_queue.put({"_stop": True})
+
+        return interrupted
+
+    if args.gui:
+        from realtime_gui import RealtimeGestureGUI
+
+        result: dict = {}
+        worker = threading.Thread(target=lambda: result.update(interrupted=run_session()), daemon=True)
+        worker.start()
+        gui = RealtimeGestureGUI(
+            model_label=classifier_label, sensors=sensors, gesture_labels=labels, no_gesture_label=NO_GESTURE_LABEL
         )
-        writer.writeheader()
-
-        session_start = time.monotonic()
-        end_time = session_start + args.duration
-
-        cycle_kwargs = dict(
-            streams=streams,
-            model=model,
-            sensors=sensors,
-            fusion=fusion,
-            is_raw_cnn=is_raw_cnn,
-            channel_names=channel_names if is_raw_cnn else None,
-            scalar_names=scalar_names if is_raw_cnn else None,
-            args=args,
-            vote_history=vote_history,
-            writer=writer,
-            prediction_file=prediction_file,
-            session_start=session_start,
-        )
-
-        try:
-            if args.capture_mode == "trigger":
-                baseline = calibrate_idle_baseline(streams, args)
-                print(f"Waiting for gesture onset (z >= {args.trigger_z_threshold})...")
-                cooldown_until = 0.0
-                while time.monotonic() < end_time:
-                    now = time.monotonic()
-                    for stream in streams.values():
-                        stream.check_error()
-
-                    if now >= cooldown_until and activity_triggered(streams, baseline, now, args):
-                        trigger_time = now
-                        print(f"[{trigger_time - session_start:.2f}s] gesture onset detected, capturing...", flush=True)
-                        capture_end = trigger_time + args.window_seconds
-                        while time.monotonic() < capture_end:
-                            time.sleep(0.02)
-                        capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
-                        cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
-
-                    time.sleep(args.trigger_check_interval)
-            else:
-                last_prediction_time = 0.0
-                while time.monotonic() < end_time:
-                    now = time.monotonic()
-                    for stream in streams.values():
-                        stream.check_error()
-
-                    if now - last_prediction_time >= args.step_seconds:
-                        window_start = max(session_start, now - args.window_seconds)
-                        capture_and_classify(window_start=window_start, window_end=now, **cycle_kwargs)
-                        last_prediction_time = now
-
-                    time.sleep(0.02)
-        except KeyboardInterrupt:
-            interrupted = True
-            print("\nInterrupted. Stopping sensors...")
-        except RuntimeError as error:
-            interrupted = True
-            print(f"\nEvaluation failed: {error}")
-        finally:
-            close_streams(streams)
+        gui.run(gui_queue, stop_event)
+        worker.join(timeout=5)
+        interrupted = result.get("interrupted", False)
+    else:
+        interrupted = run_session()
 
     print(f"Done. Predictions saved to: {predictions_path}")
     return 1 if interrupted else 0
