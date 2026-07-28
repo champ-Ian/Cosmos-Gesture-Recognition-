@@ -27,3 +27,4 @@ logs/
 *.npz
 *.joblib
 *.confusion.png
+raw/
