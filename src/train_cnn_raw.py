@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from gesture_models import TorchRawCNNClassifier, classifier_label
+from gesture_models import LateFusionClassifier, RawSingleArrayWrapper, TorchRawCNNClassifier, classifier_label
 from sensors.common import MODELS_DIR, RESULTS_FIGURES_DIR, timestamp
 from train import split_indices
 
@@ -42,6 +42,17 @@ RAW_COLUMN_RE = re.compile(r"^(mmwave|imu|uwb|rfid)_raw_([a-z]+)_(\d+)$")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("features_csv", help="Feature table with raw_* resampled-sequence columns, e.g. raw_features.csv.")
+    parser.add_argument(
+        "--fusion",
+        choices=["early", "late"],
+        default="early",
+        help=(
+            "'early' (default) is one combined model over every sensor's raw channels + scalar "
+            "features, jointly. 'late' trains a separate TorchRawCNNClassifier per sensor (each "
+            "restricted to that sensor's own channels/features) and averages their predicted "
+            "probabilities -- mirrors train.py --fusion late for knn/svm_linear/cnn."
+        ),
+    )
     parser.add_argument("--cnn-epochs", type=int, default=200)
     parser.add_argument("--cnn-lr", type=float, default=1e-3)
     parser.add_argument("--cnn-hidden-channels", type=int, default=32)
@@ -180,7 +191,7 @@ def main() -> int:
     if actual_batch_size < requested_batch_size:
         print(f"Reducing CNN batch size from {requested_batch_size} to {actual_batch_size} because the training split has {len(X_raw_train)} examples.")
 
-    classifier_params = {
+    cnn_kwargs = {
         "epochs": args.cnn_epochs,
         "lr": args.cnn_lr,
         "hidden_channels": args.cnn_hidden_channels,
@@ -188,15 +199,45 @@ def main() -> int:
         "batch_size": actual_batch_size,
         "random_state": args.random_state,
     }
-    model = TorchRawCNNClassifier(**classifier_params)
-    model.fit(X_raw_train, X_scalar_train, y_train)
-    predictions = model.predict(X_raw_test, X_scalar_test)
+
+    if args.fusion == "early":
+        classifier_params = cnn_kwargs
+        model = TorchRawCNNClassifier(**cnn_kwargs)
+        model.fit(X_raw_train, X_scalar_train, y_train)
+        predictions = model.predict(X_raw_test, X_scalar_test)
+    else:
+        # channel/scalar names are '{sensor}_{field}' / '{sensor}_{stat}' -- the sensor is
+        # always the part before the first underscore, same convention realtime_demo.py uses.
+        sensors = sorted({name.split("_", 1)[0] for name in data["channel_names"] + data["scalar_names"]})
+        channel_names = data["channel_names"]
+        scalar_names = data["scalar_names"]
+        raw_length = data["raw_length"]
+
+        def flat_sensor_X(X_raw: np.ndarray, X_scalar: np.ndarray, sensor: str) -> np.ndarray:
+            channel_idx = [i for i, name in enumerate(channel_names) if name.startswith(f"{sensor}_")]
+            scalar_idx = [i for i, name in enumerate(scalar_names) if name.startswith(f"{sensor}_")]
+            raw_part = X_raw[:, channel_idx, :].reshape(len(X_raw), -1)
+            scalar_part = X_scalar[:, scalar_idx]
+            return np.hstack([raw_part, scalar_part])
+
+        sensor_models = {}
+        classifier_params = {}
+        for sensor in sensors:
+            sensor_channel_names = [name for name in channel_names if name.startswith(f"{sensor}_")]
+            sensor_scalar_names = [name for name in scalar_names if name.startswith(f"{sensor}_")]
+            sub_model = RawSingleArrayWrapper(sensor_channel_names, sensor_scalar_names, raw_length, **cnn_kwargs)
+            sub_model.fit(flat_sensor_X(X_raw_train, X_scalar_train, sensor), y_train)
+            sensor_models[sensor] = sub_model
+            classifier_params[sensor] = cnn_kwargs
+        model = LateFusionClassifier(sensor_models, sensors)
+        per_sensor_X_test = {sensor: flat_sensor_X(X_raw_test, X_scalar_test, sensor) for sensor in sensors}
+        predictions = model.predict(per_sensor_X_test)
 
     accuracy = float(accuracy_score(y_test, predictions))
     labels_order = sorted(set(y))
     matrix = confusion_matrix(y_test, predictions, labels=labels_order)
 
-    model_out = Path(args.model_out) if args.model_out else MODELS_DIR / f"cnn_raw_{timestamp()}.joblib"
+    model_out = Path(args.model_out) if args.model_out else MODELS_DIR / f"cnn_raw_{args.fusion}_{timestamp()}.joblib"
     model_out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model": model,
@@ -204,6 +245,7 @@ def main() -> int:
         "classifier": "cnn_raw",
         "classifier_label": classifier_label("cnn_raw"),
         "classifier_params": classifier_params,
+        "fusion": args.fusion,
         "scalar_names": data["scalar_names"],
         "channel_names": data["channel_names"],
         "raw_length": data["raw_length"],
@@ -224,7 +266,7 @@ def main() -> int:
     # pins the label's right edge to the tick instead.
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
     ax.tick_params(axis="both", labelsize=8)
-    ax.set_title(f"{classifier_label('cnn_raw')} (raw+scalar)\nAccuracy: {accuracy:.3f}")
+    ax.set_title(f"{classifier_label('cnn_raw')} ({args.fusion} fusion, raw+scalar)\nAccuracy: {accuracy:.3f}")
     fig.tight_layout()
     fig.savefig(confusion_out, dpi=180)
     plt.close(fig)
@@ -241,6 +283,7 @@ def main() -> int:
         "classifier": "cnn_raw",
         "classifier_label": classifier_label("cnn_raw"),
         "classifier_params": classifier_params,
+        "fusion": args.fusion,
         "model": str(model_out),
         "confusion_matrix": str(confusion_out),
         "accuracy": accuracy,

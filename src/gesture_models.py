@@ -394,6 +394,48 @@ class TorchRawCNNClassifier:
         return np.array(self.classes_)[indices]
 
 
+class RawSingleArrayWrapper:
+    """Wraps a `TorchRawCNNClassifier` behind a single-flat-array `.fit(X, y)` /
+    `.predict(X)` / `.predict_proba(X)` interface, splitting `X` back into
+    `(X_raw, X_scalar)` by the stored channel/scalar layout.
+
+    `LateFusionClassifier` calls `sensor_models[sensor].predict_proba(arr)` --
+    one array, like every sklearn estimator -- but `TorchRawCNNClassifier`
+    takes two. Rather than special-case `LateFusionClassifier` for raw models,
+    this makes a per-sensor raw CNN look like any other sensor_model, so late
+    fusion for `cnn_raw` reuses the exact same averaging code `knn`/`svm_linear`/
+    `cnn` already use instead of a separate implementation.
+    """
+
+    def __init__(self, channel_names: list[str], scalar_names: list[str], raw_length: int, **cnn_kwargs):
+        self.channel_names = channel_names
+        self.scalar_names = scalar_names
+        self.raw_length = raw_length
+        self.model = TorchRawCNNClassifier(**cnn_kwargs)
+        self.classes_: list = []
+
+    def _split(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        X = np.atleast_2d(np.asarray(X, dtype=np.float32))
+        n_raw = len(self.channel_names) * self.raw_length
+        X_raw = X[:, :n_raw].reshape(-1, len(self.channel_names), self.raw_length)
+        X_scalar = X[:, n_raw:]
+        return X_raw, X_scalar
+
+    def fit(self, X, y) -> "RawSingleArrayWrapper":
+        X_raw, X_scalar = self._split(X)
+        self.model.fit(X_raw, X_scalar, y)
+        self.classes_ = self.model.classes_
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        X_raw, X_scalar = self._split(X)
+        return self.model.predict(X_raw, X_scalar)
+
+    def predict_proba(self, X) -> np.ndarray:
+        X_raw, X_scalar = self._split(X)
+        return self.model.predict_proba(X_raw, X_scalar)
+
+
 class LateFusionClassifier:
     """Averages per-sensor predicted probabilities (late fusion).
 
