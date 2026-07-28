@@ -7,7 +7,7 @@ single sensor gives you the "single-sensor baseline" the project rubric
 asks for; multiple sensors gives you the "fused model" to compare against
 it), a fusion strategy (`--fusion early|late`, see the project spec's
 Fusion type table), and a classifier to compare against another run
-(`--classifier knn|svm_linear|cnn`).
+(`--classifier knn|svm_linear|cnn|random_forest`).
 
 `--features stats` (default) uses hand-engineered summary-stat features
 (mean/std/energy/etc, see extract_features.py). `--features raw` instead
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated sensor subset to use, e.g. 'mmwave' or 'mmwave,imu,uwb'.",
     )
     parser.add_argument("--fusion", choices=["early", "late"], default="early", help="How to combine multiple sensors.")
-    parser.add_argument("--classifier", choices=["knn", "svm_linear", "cnn"], default="knn")
+    parser.add_argument("--classifier", choices=["knn", "svm_linear", "cnn", "random_forest"], default="knn")
     parser.add_argument("--svm-c", type=float, default=1.0)
     parser.add_argument("--knn-neighbors", type=int, default=5)
     parser.add_argument("--knn-weights", choices=["uniform", "distance"], default="distance")
@@ -82,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cnn-hidden-channels", type=int, default=32, help="Conv1d channel width for --classifier cnn.")
     parser.add_argument("--cnn-dropout", type=float, default=0.3, help="Dropout before the final layer for --classifier cnn.")
     parser.add_argument("--cnn-batch-size", type=int, default=16, help="Batch size for --classifier cnn.")
+    parser.add_argument("--rf-n-estimators", type=int, default=200, help="Number of trees for --classifier random_forest.")
+    parser.add_argument("--rf-max-depth", type=int, default=None, help="Max tree depth for --classifier random_forest (default: unlimited).")
     parser.add_argument("--test-size", type=float, default=0.25)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument(
@@ -396,6 +398,8 @@ def main() -> int:
             args.cnn_hidden_channels,
             args.cnn_dropout,
             args.cnn_batch_size,
+            args.rf_n_estimators,
+            args.rf_max_depth,
         )
         model.fit(X_train, y_train)
         predictions = model.predict(X_test)
@@ -416,6 +420,8 @@ def main() -> int:
                 args.cnn_hidden_channels,
                 args.cnn_dropout,
                 args.cnn_batch_size,
+                args.rf_n_estimators,
+                args.rf_max_depth,
             )
             sub_model.fit(per_sensor_X_train[sensor], y_train)
             sensor_models[sensor] = sub_model

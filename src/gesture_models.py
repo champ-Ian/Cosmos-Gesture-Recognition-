@@ -23,6 +23,7 @@ def classifier_label(classifier: str) -> str:
         "svm_linear": "Linear SVM",
         "cnn": "1D-CNN",
         "cnn_raw": "1D-CNN (raw sequences)",
+        "random_forest": "Random Forest",
     }[classifier]
 
 
@@ -38,6 +39,8 @@ def build_classifier(
     cnn_hidden_channels: int = 32,
     cnn_dropout: float = 0.3,
     cnn_batch_size: int = 16,
+    rf_n_estimators: int = 200,
+    rf_max_depth: int | None = None,
 ):
     """Build an (untrained) classifier. Returns (model, params).
 
@@ -60,6 +63,19 @@ def build_classifier(
             "random_state": random_state,
         }
         return make_pipeline(StandardScaler(), SVC(**params)), params
+
+    if classifier == "random_forest":
+        from sklearn.ensemble import RandomForestClassifier
+
+        params = {
+            "n_estimators": int(rf_n_estimators),
+            "max_depth": rf_max_depth,
+            "class_weight": "balanced",
+            "random_state": random_state,
+        }
+        # No StandardScaler: tree splits are scale-invariant, unlike KNN/SVM's distance
+        # or margin-based decision rules.
+        return RandomForestClassifier(**params), params
 
     if classifier == "knn":
         requested_neighbors = max(1, int(knn_neighbors))
