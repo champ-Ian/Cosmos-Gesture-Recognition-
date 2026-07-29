@@ -103,9 +103,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "'interval' (default) predicts every --step-seconds regardless of what's happening -- "
             "windows constantly straddle real gesture boundaries. 'trigger' instead watches a cheap "
-            "motion-activity signal and only starts capturing once it spikes above an idle baseline, "
-            "so the capture is roughly gesture-bounded like training data was; once triggered, it "
-            "still predicts every --step-seconds on the growing window (not silent until the end)."
+            "motion-activity signal and only captures+classifies once it spikes above an idle "
+            "baseline, so the window is roughly gesture-bounded like training data was."
         ),
     )
     parser.add_argument(
@@ -136,15 +135,7 @@ def parse_args() -> argparse.Namespace:
         "--trigger-cooldown-seconds",
         type=float,
         default=1.0,
-        help="[trigger mode] If a motion episode never reaches --confidence-threshold, minimum "
-        "sustained-quiet time before falling back to idle ('no motion detected').",
-    )
-    parser.add_argument(
-        "--rest-seconds",
-        type=float,
-        default=1.0,
-        help="[trigger mode] Fixed pause after each confirmed/announced prediction, during which "
-        "'rest' is reported and motion detection is paused, before watching for the next gesture.",
+        help="[trigger mode] Minimum quiet time after a capture before a new trigger can fire.",
     )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
@@ -564,91 +555,42 @@ def activity_triggered(streams: dict, baseline: dict[str, tuple[float, float]], 
 
 def run_trigger_state_machine(
     streams: dict,
-    model,
-    sensors: list[str],
-    fusion: str | None,
-    is_raw_cnn: bool,
-    channel_names: list[str] | None,
-    scalar_names: list[str] | None,
     args: argparse.Namespace,
+    session_start: float,
     end_time: float,
     stop_event: threading.Event,
     cycle_kwargs: dict,
     gui_queue: "queue.Queue | None",
 ) -> None:
-    """--capture-mode trigger's loop: a five-state cycle --
-
-        idle ("no motion detected")
-          -> motion ("motion detected")
-          -> once the model is confident, the actual gesture gets reported
-             (via `capture_and_classify`, so it's logged/printed/GUI-pushed
-             the normal way)
-          -> rest ("rest") -- a fixed --rest-seconds pause, motion detection
-             paused, before the next cycle can start
-          -> back to idle ("no motion detected")
-          -> repeat.
-
-    Each state gets its own distinct announcement. In the "motion" state,
-    `_classify_window` silently re-probes a window that grows from motion
-    onset up to --window-seconds wide (no CSV/print/GUI side effects per
-    probe) -- that's what lets the classification window roughly match the
-    gesture's actual length instead of guessing on a fixed timer the way
-    --capture-mode interval does. If a motion episode never reaches
-    --confidence-threshold, it falls back to idle once activity has been
-    quiet for --trigger-cooldown-seconds (no "rest" pause in that case --
-    rest is specifically the pause after a real, reported prediction).
-    """
+    """--capture-mode trigger's loop: calibrate an idle baseline, then wait for
+    any sensor's activity to spike --trigger-z-threshold std-devs above it,
+    capture a fixed --window-seconds window starting at that trigger, classify
+    it once (via `capture_and_classify`, so it's logged/printed/GUI-pushed the
+    normal way), then hold off on watching for a new trigger until
+    --trigger-cooldown-seconds of quiet has passed."""
 
     def announce_status(text: str) -> None:
         print(text, flush=True)
         if gui_queue is not None:
             gui_queue.put({"_status": text})
 
-    announce_status(f"calibrating -- stay still ({args.calibration_seconds:.0f}s)...")
     baseline = calibrate_idle_baseline(streams, args)
-
-    state = "idle"
-    motion_start: float | None = None
-    quiet_since: float | None = None
-    rest_until: float | None = None
-
-    announce_status("no motion detected")
+    announce_status(f"Waiting for gesture onset (z >= {args.trigger_z_threshold})...")
+    cooldown_until = 0.0
 
     while time.monotonic() < end_time and not stop_event.is_set():
         now = time.monotonic()
         for stream in streams.values():
             stream.check_error()
 
-        if state == "idle":
-            if activity_triggered(streams, baseline, now, args):
-                state = "motion"
-                motion_start = now
-                quiet_since = None
-                announce_status("motion detected")
-        elif state == "motion":
-            window_start = max(motion_start, now - args.window_seconds)
-            probe = _classify_window(streams, window_start, now, model, sensors, fusion, is_raw_cnn, channel_names, scalar_names)
-            if probe is not None:
-                _, probe_confidence = probe
-                if probe_confidence is not None and probe_confidence >= args.confidence_threshold:
-                    capture_and_classify(window_start=window_start, window_end=now, **cycle_kwargs)
-                    state = "rest"
-                    rest_until = now + args.rest_seconds
-                    announce_status("rest")
-
-            if state == "motion":  # still unconfirmed -- check whether it's settled back to quiet
-                if activity_triggered(streams, baseline, now, args):
-                    quiet_since = None
-                elif quiet_since is None:
-                    quiet_since = now
-                elif now - quiet_since >= args.trigger_cooldown_seconds:
-                    state = "idle"
-                    motion_start = None
-                    announce_status("no motion detected")
-        elif state == "rest":
-            if now >= rest_until:
-                state = "idle"
-                announce_status("no motion detected")
+        if now >= cooldown_until and activity_triggered(streams, baseline, now, args):
+            trigger_time = now
+            announce_status(f"[{trigger_time - session_start:.2f}s] gesture onset detected, capturing...")
+            capture_end = trigger_time + args.window_seconds
+            while time.monotonic() < capture_end:
+                time.sleep(0.02)
+            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
+            cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
 
         time.sleep(args.trigger_check_interval)
 
@@ -745,13 +687,8 @@ def main() -> int:
                 if args.capture_mode == "trigger":
                     run_trigger_state_machine(
                         streams=streams,
-                        model=model,
-                        sensors=sensors,
-                        fusion=fusion,
-                        is_raw_cnn=is_raw_cnn,
-                        channel_names=channel_names if is_raw_cnn else None,
-                        scalar_names=scalar_names if is_raw_cnn else None,
                         args=args,
+                        session_start=session_start,
                         end_time=end_time,
                         stop_event=stop_event,
                         cycle_kwargs=cycle_kwargs,
