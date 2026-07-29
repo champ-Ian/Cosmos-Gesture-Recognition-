@@ -42,6 +42,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -105,6 +106,14 @@ def parse_args() -> argparse.Namespace:
         "--test-collector",
         action="append",
         help="Hold out this collector as the test set (all others train). Repeatable/comma separated.",
+    )
+    parser.add_argument(
+        "--group-by-trial",
+        action="store_true",
+        help="Group rows by base trial id (stripping augment_data.py's _aug00/_aug01/... suffix from "
+        "session_dir) before the random split, so a trial's synthetic siblings always land on the same "
+        "side as its real parent. Without this, augment_data.py's near-duplicate copies can leak across "
+        "the train/test boundary on augmented datasets and inflate accuracy.",
     )
     parser.add_argument("--model-out", help="Output .joblib path. Default: <repo>/models/<classifier>_<fusion>_<sensors>_<timestamp>.joblib")
     parser.add_argument("--confusion-out", help="Output confusion matrix PNG. Default: <repo>/results/figures/.")
@@ -302,7 +311,15 @@ def build_examples(
     return per_sensor_examples, labels, collectors, sources, session_dirs, skipped
 
 
-def split_indices(y: np.ndarray, collectors: np.ndarray, args: argparse.Namespace):
+_AUG_SUFFIX_RE = re.compile(r"_aug\d+$")
+
+
+def base_trial_id(session_dir: str) -> str:
+    """Strip augment_data.py's `_aug00`/`_aug01`/... suffix so a synthetic trial's id matches its real parent."""
+    return _AUG_SUFFIX_RE.sub("", Path(session_dir).name)
+
+
+def split_indices(y: np.ndarray, collectors: np.ndarray, session_dirs: list[str], args: argparse.Namespace):
     test_collectors = normalize_filter(args.test_collector)
     if test_collectors:
         test_mask = np.array([c in test_collectors for c in collectors], dtype=bool)
@@ -318,6 +335,29 @@ def split_indices(y: np.ndarray, collectors: np.ndarray, args: argparse.Namespac
         return train_idx, test_idx, "collector_holdout"
 
     from sklearn.model_selection import train_test_split
+
+    if args.group_by_trial:
+        groups = np.array([base_trial_id(s) for s in session_dirs])
+        unique_groups, first_seen = np.unique(groups, return_index=True)
+        group_labels = y[first_seen]
+        class_counts = {label: int((group_labels == label).sum()) for label in sorted(set(group_labels))}
+        stratify = group_labels if min(class_counts.values()) >= 2 else None
+        n_groups = len(unique_groups)
+        split_test_size = args.test_size
+        if stratify is not None:
+            n_classes = len(class_counts)
+            requested = math.ceil(args.test_size * n_groups) if args.test_size < 1 else int(args.test_size)
+            split_test_size = min(max(requested, n_classes), n_groups - n_classes)
+
+        group_idx = np.arange(n_groups)
+        train_groups, test_groups = train_test_split(
+            group_idx, test_size=split_test_size, random_state=args.random_state, stratify=stratify
+        )
+        train_group_ids = set(unique_groups[train_groups])
+        test_group_ids = set(unique_groups[test_groups])
+        train_idx = np.array([i for i, g in enumerate(groups) if g in train_group_ids])
+        test_idx = np.array([i for i, g in enumerate(groups) if g in test_group_ids])
+        return train_idx, test_idx, "random_grouped"
 
     class_counts = {label: int((y == label).sum()) for label in sorted(set(y))}
     stratify = y if min(class_counts.values()) >= 2 else None
@@ -388,7 +428,7 @@ def main() -> int:
     collectors_array = np.asarray(collectors)
     class_counts = {label: int((y == label).sum()) for label in sorted(set(labels))}
 
-    train_idx, test_idx, split_method = split_indices(y, collectors_array, args)
+    train_idx, test_idx, split_method = split_indices(y, collectors_array, session_dirs, args)
     y_train, y_test = y[train_idx], y[test_idx]
     train_only_check = set(y_test) - set(y_train)
     if train_only_check:
