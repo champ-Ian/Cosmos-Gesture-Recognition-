@@ -132,7 +132,7 @@
   },
   "confusion_matrix": "results/figures/rf_regular_confusion.png",
   "datasets": [
-    "/Users/vibha/COSMOS-Cluster10/labs/Cosmos-Gesture-Recognition-/src/features.csv"
+    "/Users/ianba/Desktop/COSMOS/final project/Cosmos-Gesture-Recognition-/src/features.csv"
   ],
   "fusion": "early",
   "missing_datasets": [],
