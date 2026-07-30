@@ -166,7 +166,7 @@ def main() -> int:
         raise SystemExit("Need at least four usable rows to train.")
     class_counts = {label: int((y == label).sum()) for label in sorted(set(data["labels"]))}
 
-    train_idx, test_idx, split_method = split_indices(y, collectors_array, args)
+    train_idx, test_idx, split_method = split_indices(y, collectors_array, data["session_dirs"], args)
     y_train, y_test = y[train_idx], y[test_idx]
     train_only_check = set(y_test) - set(y_train)
     if train_only_check:
