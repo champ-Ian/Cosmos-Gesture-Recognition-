@@ -336,7 +336,7 @@ def split_indices(y: np.ndarray, collectors: np.ndarray, session_dirs: list[str]
 
     from sklearn.model_selection import train_test_split
 
-    if args.group_by_trial:
+    if getattr(args, "group_by_trial", False):
         groups = np.array([base_trial_id(s) for s in session_dirs])
         unique_groups, first_seen = np.unique(groups, return_index=True)
         group_labels = y[first_seen]
