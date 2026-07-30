@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gesture",
         action="append",
-        help="Gesture label (see gestures.py). Can be repeated or comma separated. Default: all 15 gestures.",
+        help="Gesture label (see gestures.py). Can be repeated or comma separated. Default: all registered gestures.",
     )
     parser.add_argument(
         "--trials",

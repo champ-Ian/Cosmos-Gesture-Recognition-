@@ -133,6 +133,15 @@ GESTURES: dict[str, GestureSpec] = {
             ("imu",),
             group="periodic",
         ),
+        GestureSpec(
+            "resting",
+            "Resting / No Gesture",
+            "Do NOT perform a gesture. Stand naturally -- vary hands at sides / clasped in front / crossed / "
+            "on hips / a casual scratch or adjustment across trials, and vary your distance/position slightly "
+            "relative to the sensors. Stay relaxed, not frozen -- natural small sway/fidgeting is expected and "
+            "wanted, not a rigid statue pose.",
+            ("mmwave", "imu", "uwb"),
+        ),
     )
 }
 

@@ -169,6 +169,25 @@ def parse_args() -> argparse.Namespace:
         "motion-based gate on top of --confidence-threshold, for when the model confidently guesses a real "
         "gesture during near-total stillness. Set to 0 to disable.",
     )
+    parser.add_argument(
+        "--settle-window-seconds",
+        type=float,
+        default=1.0,
+        help="[trigger mode] Length of the tail end of the captured window checked for --max-end-activity-z "
+        "-- training trials were collected as 'move into the completed pose, then hold it,' so a real "
+        "gesture should end still. Transit motion between two real gestures doesn't settle, so this catches "
+        "it even though --min-activity-z (which only checks for SOME motion somewhere) would let it through.",
+    )
+    parser.add_argument(
+        "--max-end-activity-z",
+        type=float,
+        default=1.0,
+        help="[trigger mode] If every sensor's activity in the last --settle-window-seconds of the window "
+        "is below this many std-devs above the idle baseline, the window is considered 'settled' (matches "
+        "how training trials ended). If it's still moving that late in the window, the prediction is forced "
+        "to 'no_gesture' -- this is what catches transit-time false positives. Set to a very large number "
+        "(e.g. 1000) to disable.",
+    )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
     parser.add_argument(
@@ -516,7 +535,22 @@ def capture_and_classify(
             if (score - mean) / std >= args.min_activity_z:
                 below_activity = False
                 break
-    below_threshold = below_threshold or below_activity
+
+    not_settled = False
+    if baseline is not None and args.settle_window_seconds > 0:
+        settle_start = max(window_start, window_end - args.settle_window_seconds)
+        for sensor, stream in streams.items():
+            if sensor not in baseline:
+                continue
+            score = sensor_activity_score(sensor, stream.window(settle_start, window_end))
+            if score is None:
+                continue
+            mean, std = baseline[sensor]
+            if (score - mean) / std > args.max_end_activity_z:
+                not_settled = True
+                break
+
+    below_threshold = below_threshold or below_activity or not_settled
     gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
     vote_history.append(gated_prediction)
     if args.vote_window <= 1:
@@ -561,6 +595,8 @@ def capture_and_classify(
         conf_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
         if below_activity:
             below_text = f" [below min-activity-z {args.min_activity_z:.2f}, raw guess: {raw_prediction}]"
+        elif not_settled:
+            below_text = f" [never settled by end of window, raw guess: {raw_prediction}]"
         elif below_threshold:
             below_text = f" [below {effective_threshold:.2f}, raw guess: {raw_prediction}]"
         else:
