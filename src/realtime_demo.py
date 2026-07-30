@@ -151,6 +151,14 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="[trigger mode] Minimum quiet time after a capture before a new trigger can fire.",
     )
+    parser.add_argument(
+        "--idle-reset-seconds",
+        type=float,
+        default=2.0,
+        help="[trigger mode] If this many seconds pass with no new trigger, actively push 'no_gesture' to "
+        "the display/log instead of leaving the last real prediction frozen on screen while you're standing "
+        "still. Set to 0 to disable.",
+    )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
     parser.add_argument(
@@ -603,6 +611,8 @@ def run_trigger_state_machine(
     baseline = calibrate_idle_baseline(streams, args)
     announce_status(f"Waiting for gesture onset (z >= {args.trigger_z_threshold})...")
     cooldown_until = 0.0
+    last_capture_end = time.monotonic()
+    showing_gesture = False
 
     while time.monotonic() < end_time and not stop_event.is_set():
         now = time.monotonic()
@@ -617,6 +627,28 @@ def run_trigger_state_machine(
                 time.sleep(0.02)
             capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
             cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
+            last_capture_end = time.monotonic()
+            showing_gesture = True
+        elif (
+            showing_gesture
+            and args.idle_reset_seconds > 0
+            and now - last_capture_end >= args.idle_reset_seconds
+        ):
+            print(f"prediction: {NO_GESTURE_LABEL} (idle)", flush=True)
+            if gui_queue is not None:
+                gui_queue.put(
+                    {
+                        "prediction": NO_GESTURE_LABEL,
+                        "confidence": None,
+                        "time_s": now - session_start,
+                        "raw_prediction": NO_GESTURE_LABEL,
+                        "raw_confidence": None,
+                        "below_threshold": False,
+                        "vote_fraction": None,
+                        "vote_window": args.vote_window,
+                    }
+                )
+            showing_gesture = False
 
         time.sleep(args.trigger_check_interval)
 
