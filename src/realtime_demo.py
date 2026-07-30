@@ -159,6 +159,16 @@ def parse_args() -> argparse.Namespace:
         "the display/log instead of leaving the last real prediction frozen on screen while you're standing "
         "still. Set to 0 to disable.",
     )
+    parser.add_argument(
+        "--min-activity-z",
+        type=float,
+        default=2.0,
+        help="[trigger mode] After capturing a full window, require at least one sensor's activity across "
+        "the WHOLE window (not just the trigger instant) to be this many std-devs above the idle baseline, "
+        "or the prediction is forced to 'no_gesture' regardless of the model's confidence. This is a harder, "
+        "motion-based gate on top of --confidence-threshold, for when the model confidently guesses a real "
+        "gesture during near-total stillness. Set to 0 to disable.",
+    )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
     parser.add_argument(
@@ -479,6 +489,7 @@ def capture_and_classify(
     prediction_file,
     session_start: float,
     gui_queue: "queue.Queue | None" = None,
+    baseline: dict[str, tuple[float, float]] | None = None,
 ) -> None:
     """Extract features over [window_start, window_end], predict, gate on
     --confidence-threshold, log to CSV, and print -- shared by --capture-mode
@@ -491,6 +502,21 @@ def capture_and_classify(
     raw_prediction, raw_confidence = result
     effective_threshold = args.class_confidence_thresholds.get(raw_prediction, args.confidence_threshold)
     below_threshold = raw_confidence is not None and raw_confidence < effective_threshold
+
+    below_activity = False
+    if baseline is not None and args.min_activity_z > 0:
+        below_activity = True
+        for sensor, stream in streams.items():
+            if sensor not in baseline:
+                continue
+            score = sensor_activity_score(sensor, stream.window(window_start, window_end))
+            if score is None:
+                continue
+            mean, std = baseline[sensor]
+            if (score - mean) / std >= args.min_activity_z:
+                below_activity = False
+                break
+    below_threshold = below_threshold or below_activity
     gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
     vote_history.append(gated_prediction)
     if args.vote_window <= 1:
@@ -533,7 +559,12 @@ def capture_and_classify(
 
     if args.vote_window <= 1:
         conf_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
-        below_text = f" [below {args.confidence_threshold:.2f}, raw guess: {raw_prediction}]" if below_threshold else ""
+        if below_activity:
+            below_text = f" [below min-activity-z {args.min_activity_z:.2f}, raw guess: {raw_prediction}]"
+        elif below_threshold:
+            below_text = f" [below {effective_threshold:.2f}, raw guess: {raw_prediction}]"
+        else:
+            below_text = ""
         print(f"prediction: {display_prediction}{conf_text}{below_text}", flush=True)
     else:
         vote_text = "" if vote_fraction is None else f" vote={vote_fraction:.2f}"
@@ -625,7 +656,7 @@ def run_trigger_state_machine(
             capture_end = trigger_time + args.window_seconds
             while time.monotonic() < capture_end:
                 time.sleep(0.02)
-            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
+            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), baseline=baseline, **cycle_kwargs)
             cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
             last_capture_end = time.monotonic()
             showing_gesture = True
