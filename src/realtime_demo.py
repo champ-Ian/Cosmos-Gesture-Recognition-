@@ -97,6 +97,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--class-confidence-threshold",
+        action="append",
+        default=[],
+        metavar="LABEL=VALUE",
+        help=(
+            "Per-gesture override of --confidence-threshold, e.g. --class-confidence-threshold "
+            "one_arm_boxing=0.2 --class-confidence-threshold t_arm=0.2. Repeatable. A raw prediction "
+            "is only gated to 'no_gesture' if its confidence is below THAT label's threshold (falls "
+            "back to --confidence-threshold for any label not listed) -- lets a gesture that's "
+            "reliably correct but chronically low-confidence clear the bar without loosening the "
+            "threshold for every other gesture too."
+        ),
+    )
+    parser.add_argument(
         "--capture-mode",
         choices=["interval", "trigger"],
         default="interval",
@@ -174,7 +188,18 @@ def parse_args() -> argparse.Namespace:
     rfid_group.add_argument("--rfid-host", default="192.168.137.1")
     rfid_group.add_argument("--rfid-tcp-port", type=int, default=9055)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.class_confidence_thresholds = {}
+    for item in args.class_confidence_threshold:
+        for part in item.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise SystemExit(f"--class-confidence-threshold expects LABEL=VALUE, got: {part!r}")
+            label, value = part.split("=", 1)
+            args.class_confidence_thresholds[label.strip()] = float(value)
+    return args
 
 
 def majority_vote(predictions) -> tuple[str, float, dict]:
@@ -456,7 +481,8 @@ def capture_and_classify(
     if result is None:
         return
     raw_prediction, raw_confidence = result
-    below_threshold = raw_confidence is not None and raw_confidence < args.confidence_threshold
+    effective_threshold = args.class_confidence_thresholds.get(raw_prediction, args.confidence_threshold)
+    below_threshold = raw_confidence is not None and raw_confidence < effective_threshold
     gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
     vote_history.append(gated_prediction)
     if args.vote_window <= 1:
