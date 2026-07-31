@@ -196,6 +196,15 @@ def parse_args() -> argparse.Namespace:
         help="Show a live Tkinter window (big color-coded prediction, confidence bar, "
         "recent-prediction history) instead of terminal-only output.",
     )
+    parser.add_argument(
+        "--binary-display",
+        action="store_true",
+        help="Testing aid: collapse the displayed/GUI prediction to just 'gesture' or 'no_gesture' "
+        "instead of the specific class name, to isolate whether the no-movement gates work at all, "
+        "separate from whether the specific gesture guess is correct. The real predicted label is "
+        "still logged in full to the CSV and shown in the bracketed raw-guess debug text -- this only "
+        "simplifies the headline display. Not meant to be left on permanently.",
+    )
 
     mmwave_group = parser.add_argument_group("mmWave radar (TI xWRL6432)")
     mmwave_group.add_argument("--mmwave-port")
@@ -589,10 +598,14 @@ def capture_and_classify(
     )
     prediction_file.flush()
 
+    shown_prediction = display_prediction
+    if args.binary_display and display_prediction != NO_GESTURE_LABEL:
+        shown_prediction = "gesture"
+
     if gui_queue is not None:
         gui_queue.put(
             {
-                "prediction": display_prediction,
+                "prediction": shown_prediction,
                 "confidence": display_confidence,
                 "time_s": window_end - session_start,
                 "raw_prediction": raw_prediction,
@@ -613,11 +626,11 @@ def capture_and_classify(
             below_text = f" [below {effective_threshold:.2f}, raw guess: {raw_prediction}]"
         else:
             below_text = ""
-        print(f"prediction: {display_prediction}{conf_text}{below_text}", flush=True)
+        print(f"prediction: {shown_prediction}{conf_text}{below_text}", flush=True)
     else:
         vote_text = "" if vote_fraction is None else f" vote={vote_fraction:.2f}"
         raw_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
-        print(f"prediction: {display_prediction}{vote_text} | raw: {raw_prediction}{raw_text}", flush=True)
+        print(f"prediction: {shown_prediction}{vote_text} | raw: {raw_prediction}{raw_text}", flush=True)
 
 
 def calibrate_idle_baseline(streams: dict, args: argparse.Namespace) -> dict[str, tuple[float, float]]:
