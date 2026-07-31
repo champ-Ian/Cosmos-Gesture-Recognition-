@@ -3,25 +3,54 @@
 Live/near-real-time gesture evaluation using a model trained by `train.py`.
 
 Modeled on `UWB_lab/eval_realtime.py`: opens whichever sensor streams the
-loaded model actually needs (`payload["sensors"]`), keeps a sliding time
-window per sensor, extracts the same features used during training (see
-extract_features.py), predicts every `--step-seconds`, and optionally
-smooths raw predictions over `--vote-window` recent predictions via
-majority vote. Predictions are printed live and saved to
-`sessions/eval_<name>/realtime_predictions.csv`.
+loaded model actually needs (`payload["sensors"]`).
+
+`--capture-mode trigger` (recommended) runs a proper movement-based
+segmentation pipeline instead of predicting on an arbitrary fixed-rate
+sliding window:
+
+    continuous sensor data -> movement detector -> confirm gesture start ->
+    collect the complete gesture -> confirm gesture end -> preprocess ->
+    classifier -> display -> re-arm -> back to no-gesture
+
+implemented as an explicit state machine in `run_trigger_state_machine()`:
+
+    IDLE -> START_CONFIRMATION -> COLLECTING -> END_CONFIRMATION ->
+    CLASSIFYING -> REARM -> IDLE
+
+See that function's docstring for what each state does. The key ideas: a
+single noisy detector tick can't start or end a capture on its own (that
+needs --start-confirm-seconds / --end-confirm-seconds of SUSTAINED agreement
+first); a --pre-buffer-seconds back-dates the captured window's start so the
+very beginning of the gesture -- which happens before the detector can
+confirm it -- isn't lost; and the confirmation-period idle tail at the end
+gets trimmed off before classifying, so the captured window is closer to what
+training data actually looked like (see extract_features.py) than a blind
+fixed-length window would be.
+
+`--capture-mode interval` is the older, simpler alternative: predicts every
+`--step-seconds` on a fixed-length sliding window regardless of what's
+happening, so windows constantly straddle real gesture boundaries. Kept
+around as a baseline to compare against, not recommended for actual live use.
+
+Two different "nothing to report" outcomes, and they mean different things:
+`no_gesture` = the detector never confirmed movement at all (IDLE/REARM), or
+the classifier's own prediction was the trained "resting" class.
+`unknown_gesture` = movement WAS confirmed (a real capture happened), but
+--confidence-threshold or --temporal-confirm-windows/--temporal-confirm-agreement
+couldn't get a reliable, consistent answer for which of the 15 trained
+gestures it was. Collapsing these into one label would hide the difference
+between "you didn't do anything" and "you did something, we're just not sure
+what" -- worth keeping separate rather than convenient to merge.
+
+Predictions are printed live and saved to
+`sessions/eval_<name>/realtime_predictions.csv` (including a `gate_reason`
+column: `none`/`confidence`/`not_confirmed`, showing which mechanism, if any,
+overrode the raw prediction).
 
 Only pass the `--*-port` flags for sensors your model actually uses --
 `train.py --sensors` records which ones that is, and this script tells you
 plainly if a required port is missing.
-
-`--confidence-threshold` (default 0.5) rejects low-confidence raw predictions
-before they reach display/voting/logging, replacing them with `"no_gesture"`.
-This exists because live sliding windows constantly straddle real gesture
-boundaries (unlike training, which only ever sees precisely trial-bounded
-windows) -- without a threshold, the model is forced to confidently guess a
-real gesture label even during transitions/idle time. This is a stopgap, not
-a substitute for training on an actual idle/no-gesture class; it just keeps
-low-confidence guesses from being reported as if they were real detections.
 
 Also handles models from `train_cnn_raw.py` (`payload["classifier"] ==
 "cnn_raw"`) -- those need resampled raw per-channel sequences, not the flat
@@ -70,29 +99,23 @@ from train_cnn_raw import RAW_COLUMN_RE
 # see collect.py's DEFAULT_MMWAVE_CFG for why.
 DEFAULT_MMWAVE_CFG = Path(__file__).resolve().parent / "mmwave" / "xwrL64xx-evm" / "near_field_hand_50cm.cfg"
 
-# Stand-in label for predictions below --confidence-threshold. Not a real
-# trained class -- no model ever outputs this from .predict() itself.
+# "No movement happened" -- the detector never confirmed a gesture at all
+# (IDLE/REARM), or the classifier itself predicted the trained "resting" class.
 NO_GESTURE_LABEL = "no_gesture"
+# "Movement was confirmed, but the classifier isn't confident/consistent about
+# which of the 15 real gestures it was." Different meaning from NO_GESTURE_LABEL
+# on purpose -- see --confidence-threshold's help text.
+UNKNOWN_GESTURE_LABEL = "unknown_gesture"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, help="Model .joblib from train.py.")
     parser.add_argument("--duration", type=float, default=60.0, help="Seconds to run the live session.")
-    parser.add_argument("--window-seconds", type=float, default=3.0, help="Sliding feature-extraction window. In "
-        "--capture-mode trigger, this is a MAX cap -- see --motion-stop-grace-seconds, capture ends early if "
-        "motion stops before this.")
-    parser.add_argument(
-        "--motion-stop-grace-seconds",
-        type=float,
-        default=0.4,
-        help="[trigger mode] Once a capture has started, if activity drops back to idle and stays there for "
-        "this long, end the capture early (rather than always waiting out the full --window-seconds) and "
-        "classify on however much was actually captured. A real gesture that finishes in 1.2s doesn't force "
-        "you to keep holding for the rest of a fixed 3s window. Set high (e.g. 100) to disable and always "
-        "capture the full --window-seconds like before.",
-    )
-    parser.add_argument("--step-seconds", type=float, default=0.5, help="Seconds between predictions.")
+    parser.add_argument("--window-seconds", type=float, default=3.0, help="Sliding feature-extraction window "
+        "(interval mode). In --capture-mode trigger, this is a hard MAX duration cap on one COLLECTING "
+        "episode -- actual captured length is usually shorter, bounded by --end-confirm-seconds instead.")
+    parser.add_argument("--step-seconds", type=float, default=0.5, help="Seconds between predictions (interval mode).")
     parser.add_argument(
         "--vote-window",
         type=int,
@@ -104,8 +127,10 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help=(
-            "Predictions with confidence below this are reported as 'no_gesture' instead of the "
-            "raw guess -- see the module docstring. Set to 0 to disable (always show the raw guess)."
+            "Predictions with confidence below this are reported as 'unknown_gesture' instead of the raw "
+            "guess -- movement was already confirmed by the detector, the classifier just isn't sure which "
+            "gesture it was, which is different from no movement having happened at all (see 'no_gesture' vs "
+            "'unknown_gesture' in the module docstring). Set to 0 to disable (always show the raw guess)."
         ),
     )
     parser.add_argument(
@@ -116,7 +141,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Per-gesture override of --confidence-threshold, e.g. --class-confidence-threshold "
             "one_arm_boxing=0.2 --class-confidence-threshold t_arm=0.2. Repeatable. A raw prediction "
-            "is only gated to 'no_gesture' if its confidence is below THAT label's threshold (falls "
+            "is only gated to 'unknown_gesture' if its confidence is below THAT label's threshold (falls "
             "back to --confidence-threshold for any label not listed) -- lets a gesture that's "
             "reliably correct but chronically low-confidence clear the bar without loosening the "
             "threshold for every other gesture too."
@@ -127,10 +152,10 @@ def parse_args() -> argparse.Namespace:
         choices=["interval", "trigger"],
         default="interval",
         help=(
-            "'interval' (default) predicts every --step-seconds regardless of what's happening -- "
-            "windows constantly straddle real gesture boundaries. 'trigger' instead watches a cheap "
-            "motion-activity signal and only captures+classifies once it spikes above an idle "
-            "baseline, so the window is roughly gesture-bounded like training data was."
+            "'interval' predicts every --step-seconds regardless of what's happening -- windows constantly "
+            "straddle real gesture boundaries. 'trigger' (recommended) instead runs the full movement-based "
+            "segmentation state machine -- see the module docstring -- so each captured window is properly "
+            "gesture-bounded like training data was."
         ),
     )
     parser.add_argument(
@@ -143,62 +168,79 @@ def parse_args() -> argparse.Namespace:
         "--trigger-window-seconds",
         type=float,
         default=0.4,
-        help="[trigger mode] Short lookback window used to compute the live activity signal.",
+        help="[trigger mode] Short lookback window used to compute the live activity signal each poll tick.",
     )
     parser.add_argument(
         "--trigger-check-interval",
         type=float,
         default=0.1,
-        help="[trigger mode] Seconds between activity-signal checks while waiting for a trigger.",
+        help="[trigger mode] Seconds between activity-signal checks (the state machine's poll rate).",
     )
     parser.add_argument(
         "--trigger-z-threshold",
         type=float,
         default=3.0,
-        help="[trigger mode] Trigger when any sensor's activity is this many std-devs above its idle baseline.",
+        help="[trigger mode] The movement detector: any sensor's activity this many std-devs above its idle "
+        "baseline counts as 'Gesture' for one poll tick. This is a per-tick binary decision, not a smoothed "
+        "probability -- START_CONFIRMATION/END_CONFIRMATION are what make state transitions robust to it.",
     )
     parser.add_argument(
-        "--trigger-cooldown-seconds",
+        "--pre-buffer-seconds",
         type=float,
-        default=1.0,
-        help="[trigger mode] Minimum quiet time after a capture before a new trigger can fire.",
+        default=0.3,
+        help="[trigger mode] When a gesture start is confirmed, back-date the captured window's start by this "
+        "much -- recovers the very beginning of the gesture, which happened before the detector had enough "
+        "sustained signal to confirm it (see 'preserve the true gesture boundaries' in the module docstring). "
+        "Free to do: sensor readers keep their full session history, nothing needs to be pre-recorded.",
     )
     parser.add_argument(
-        "--idle-reset-seconds",
+        "--start-confirm-seconds",
         type=float,
-        default=2.0,
-        help="[trigger mode] If this many seconds pass with no new trigger, actively push 'no_gesture' to "
-        "the display/log instead of leaving the last real prediction frozen on screen while you're standing "
-        "still. Set to 0 to disable.",
+        default=0.3,
+        help="[trigger mode] IDLE -> COLLECTING only happens after the detector says 'Gesture' for this many "
+        "CONSECUTIVE seconds (START_CONFIRMATION) -- a single noisy tick isn't enough to start a capture.",
     )
     parser.add_argument(
-        "--min-activity-z",
+        "--end-confirm-seconds",
         type=float,
-        default=2.0,
-        help="[trigger mode] After capturing a full window, require at least one sensor's activity across "
-        "the WHOLE window (not just the trigger instant) to be this many std-devs above the idle baseline, "
-        "or the prediction is forced to 'no_gesture' regardless of the model's confidence. This is a harder, "
-        "motion-based gate on top of --confidence-threshold, for when the model confidently guesses a real "
-        "gesture during near-total stillness. Set to 0 to disable.",
+        default=0.5,
+        help="[trigger mode] COLLECTING -> CLASSIFYING only happens after the detector says 'No Gesture' for "
+        "this many CONSECUTIVE seconds (END_CONFIRMATION). If activity resumes before that, it's treated as a "
+        "brief pause mid-gesture, not a real end, and collection continues rather than splitting into two "
+        "captures. The confirmation-period idle tail itself is trimmed back off before classifying.",
     )
     parser.add_argument(
-        "--settle-window-seconds",
+        "--rearm-seconds",
         type=float,
-        default=1.0,
-        help="[trigger mode] Length of the tail end of the captured window checked for --max-end-activity-z "
-        "-- training trials were collected as 'move into the completed pose, then hold it,' so a real "
-        "gesture should end still. Transit motion between two real gestures doesn't settle, so this catches "
-        "it even though --min-activity-z (which only checks for SOME motion somewhere) would let it through.",
+        default=0.5,
+        help="[trigger mode] After displaying a result, require this many CONSECUTIVE seconds of confirmed "
+        "'No Gesture' before returning to IDLE and allowing a new capture -- prevents residual settling "
+        "motion right after a gesture from immediately triggering a second, spurious capture.",
     )
     parser.add_argument(
-        "--max-end-activity-z",
+        "--min-gesture-seconds",
         type=float,
-        default=1.0,
-        help="[trigger mode] If every sensor's activity in the last --settle-window-seconds of the window "
-        "is below this many std-devs above the idle baseline, the window is considered 'settled' (matches "
-        "how training trials ended). If it's still moving that late in the window, the prediction is forced "
-        "to 'no_gesture' -- this is what catches transit-time false positives. Set to a very large number "
-        "(e.g. 1000) to disable.",
+        default=0.3,
+        help="[trigger mode] If a confirmed gesture (after pre-buffer, before end-trim) is shorter than this, "
+        "discard it as noise instead of classifying -- too short to be a real gesture attempt.",
+    )
+    parser.add_argument(
+        "--temporal-confirm-windows",
+        type=int,
+        default=1,
+        help="[trigger mode] Re-classify this many trailing sub-windows of the same capture (in addition to "
+        "the full captured window) and require --temporal-confirm-agreement of them to agree with the main "
+        "prediction before confirming it -- catches a result that only looks right when you classify the "
+        "whole blob, but flips depending on exactly how much of the capture you look at. 1 = disabled "
+        "(classify once, like before).",
+    )
+    parser.add_argument(
+        "--temporal-confirm-agreement",
+        type=float,
+        default=0.67,
+        help="[trigger mode] Fraction of --temporal-confirm-windows sub-classifications (plus the main one) "
+        "that must agree with the main prediction for it to be confirmed. Below this, forced to "
+        "'unknown_gesture' (movement was real, the classifier just isn't consistent about which gesture).",
     )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
@@ -533,9 +575,17 @@ def capture_and_classify(
 ) -> None:
     """Extract features over [window_start, window_end], predict, gate on
     --confidence-threshold, log to CSV, and print -- shared by --capture-mode
-    interval (called every --step-seconds) and trigger (called once a motion
-    episode's classification is confirmed). Does nothing if a sensor's data in
-    this window isn't usable (e.g. too few samples)."""
+    interval (called every --step-seconds) and the trigger state machine's
+    CLASSIFYING state (called once per confirmed gesture -- by construction,
+    real movement was already detected+confirmed for the whole [window_start,
+    window_end) span, so there's nothing here to re-check the ACTIVITY of; the
+    only thing left to be unsure about is WHICH gesture it was). Does nothing
+    if a sensor's data in this window isn't usable (e.g. too few samples).
+
+    `baseline` is currently unused here (kept in the signature for callers
+    that still pass it) -- activity/settledness are now the trigger state
+    machine's job (START_CONFIRMATION/END_CONFIRMATION), not a post-hoc check
+    on the finished window."""
     result = _classify_window(streams, window_start, window_end, model, sensors, fusion, is_raw_cnn, channel_names, scalar_names)
     if result is None:
         return
@@ -545,45 +595,43 @@ def capture_and_classify(
     effective_threshold = args.class_confidence_thresholds.get(raw_prediction, args.confidence_threshold)
     below_threshold = raw_confidence is not None and raw_confidence < effective_threshold
 
-    below_activity = False
-    if baseline is not None and args.min_activity_z > 0:
-        below_activity = True
-        for sensor, stream in streams.items():
-            if sensor not in baseline:
-                continue
-            score = sensor_activity_score(sensor, stream.window(window_start, window_end))
-            if score is None:
-                continue
-            mean, std = baseline[sensor]
-            if (score - mean) / std >= args.min_activity_z:
-                below_activity = False
-                break
+    not_confirmed = False
+    agreeing, sub_predictions = 1, [raw_prediction]
+    if args.temporal_confirm_windows > 1 and raw_prediction != NO_GESTURE_LABEL:
+        total_span = window_end - window_start
+        for i in range(1, args.temporal_confirm_windows):
+            sub_start = window_start + total_span * (i / args.temporal_confirm_windows)
+            sub_result = _classify_window(
+                streams, sub_start, window_end, model, sensors, fusion, is_raw_cnn, channel_names, scalar_names
+            )
+            if sub_result is not None:
+                sub_label = "resting" if sub_result[0] == "resting" else sub_result[0]
+                sub_predictions.append(NO_GESTURE_LABEL if sub_label == "resting" else sub_label)
+        agreeing = sum(1 for p in sub_predictions if p == raw_prediction)
+        agreement = agreeing / len(sub_predictions)
+        not_confirmed = agreement < args.temporal_confirm_agreement
 
-    not_settled = False
-    if baseline is not None and args.settle_window_seconds > 0:
-        settle_start = max(window_start, window_end - args.settle_window_seconds)
-        for sensor, stream in streams.items():
-            if sensor not in baseline:
-                continue
-            score = sensor_activity_score(sensor, stream.window(settle_start, window_end))
-            if score is None:
-                continue
-            mean, std = baseline[sensor]
-            if (score - mean) / std > args.max_end_activity_z:
-                not_settled = True
-                break
-
-    if below_activity:
-        gate_reason = "min_activity"
-    elif not_settled:
-        gate_reason = "not_settled"
-    elif raw_confidence is not None and raw_confidence < effective_threshold:
+    if raw_prediction == NO_GESTURE_LABEL:
+        gate_reason = "none"
+    elif not_confirmed:
+        gate_reason = "not_confirmed"
+    elif below_threshold:
         gate_reason = "confidence"
     else:
         gate_reason = "none"
 
-    below_threshold = below_threshold or below_activity or not_settled
-    gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
+    below_threshold = below_threshold or not_confirmed
+    # Movement was already confirmed by the state machine before this function was ever
+    # called -- a low-confidence/inconsistent guess means "not sure which gesture," not
+    # "no gesture happened." NO_GESTURE_LABEL itself (the model's own "resting" class, or
+    # interval mode with no confirmed movement at all) is the one case that's genuinely
+    # "nothing happened," so it stays as-is rather than becoming "unknown."
+    if below_threshold and raw_prediction != NO_GESTURE_LABEL:
+        gated_prediction = UNKNOWN_GESTURE_LABEL
+    elif below_threshold:
+        gated_prediction = NO_GESTURE_LABEL
+    else:
+        gated_prediction = raw_prediction
     vote_history.append(gated_prediction)
     if args.vote_window <= 1:
         display_prediction, display_confidence = gated_prediction, raw_confidence
@@ -630,10 +678,8 @@ def capture_and_classify(
 
     if args.vote_window <= 1:
         conf_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
-        if below_activity:
-            below_text = f" [below min-activity-z {args.min_activity_z:.2f}, raw guess: {raw_prediction}]"
-        elif not_settled:
-            below_text = f" [never settled by end of window, raw guess: {raw_prediction}]"
+        if not_confirmed:
+            below_text = f" [{agreeing}/{len(sub_predictions)} sub-windows agreed, raw guess: {raw_prediction}]"
         elif below_threshold:
             below_text = f" [below {effective_threshold:.2f}, raw guess: {raw_prediction}]"
         else:
@@ -700,72 +746,135 @@ def run_trigger_state_machine(
     cycle_kwargs: dict,
     gui_queue: "queue.Queue | None",
 ) -> None:
-    """--capture-mode trigger's loop: calibrate an idle baseline, then wait for
-    any sensor's activity to spike --trigger-z-threshold std-devs above it.
-    Once triggered, keep extending the capture while motion continues, ending
-    it early (--motion-stop-grace-seconds of quiet) or at the --window-seconds
-    cap, whichever comes first, then classifies whatever was actually captured
-    (via `capture_and_classify`, so it's logged/printed/GUI-pushed the normal
-    way), then holds off on watching for a new trigger until
-    --trigger-cooldown-seconds of quiet has passed."""
+    """--capture-mode trigger's loop: a movement-based segmentation state machine.
+
+    IDLE -> START_CONFIRMATION -> COLLECTING -> END_CONFIRMATION -> CLASSIFYING -> REARM -> IDLE
+
+    IDLE: waiting, displaying 'no_gesture'. The instant the detector
+    (activity_triggered(), one poll-tick binary decision) says "Gesture",
+    move to START_CONFIRMATION.
+
+    START_CONFIRMATION: the detector must keep saying "Gesture" for
+    --start-confirm-seconds STRAIGHT before a capture actually starts -- one
+    noisy tick drops back to IDLE instead of starting a spurious capture.
+
+    COLLECTING: the window's start is back-dated by --pre-buffer-seconds
+    (recovering the bit of the gesture that happened before
+    START_CONFIRMATION finished confirming it -- free to do, since the sensor
+    readers keep their whole session's history, nothing needs to be
+    pre-recorded) and capture keeps extending for as long as the detector
+    keeps saying "Gesture", up to a hard --window-seconds cap. The instant it
+    says "No Gesture", move to END_CONFIRMATION.
+
+    END_CONFIRMATION: the detector must keep saying "No Gesture" for
+    --end-confirm-seconds STRAIGHT before the gesture is considered over -- if
+    it flips back to "Gesture" first, that was a brief pause mid-gesture, not
+    the end, and COLLECTING resumes instead of splitting one gesture into two
+    captures. Once confirmed, the window's end is trimmed back to the instant
+    "No Gesture" was FIRST seen, so the confirmation period's own idle time
+    isn't included in what gets classified.
+
+    CLASSIFYING: captures shorter than --min-gesture-seconds are discarded as
+    noise; everything else goes through `capture_and_classify` exactly once.
+
+    REARM: after a result is shown (or a too-short capture discarded),
+    require --rearm-seconds of CONTINUOUS confirmed "No Gesture" before
+    allowing IDLE again -- keeps residual settling motion right after a
+    gesture from immediately starting a second, spurious capture."""
 
     def announce_status(text: str) -> None:
         print(text, flush=True)
         if gui_queue is not None:
             gui_queue.put({"_status": text})
 
+    def push_no_gesture(now: float) -> None:
+        print(f"prediction: {NO_GESTURE_LABEL}", flush=True)
+        if gui_queue is not None:
+            gui_queue.put(
+                {
+                    "prediction": NO_GESTURE_LABEL,
+                    "confidence": None,
+                    "time_s": now - session_start,
+                    "raw_prediction": NO_GESTURE_LABEL,
+                    "raw_confidence": None,
+                    "below_threshold": False,
+                    "vote_fraction": None,
+                    "vote_window": args.vote_window,
+                }
+            )
+
     baseline = calibrate_idle_baseline(streams, args)
     announce_status(f"Waiting for gesture onset (z >= {args.trigger_z_threshold})...")
-    cooldown_until = 0.0
-    last_capture_end = time.monotonic()
-    showing_gesture = False
+    push_no_gesture(time.monotonic())
+
+    state = "IDLE"
+    start_candidate_time = 0.0
+    gesture_start_time = 0.0
+    gesture_end_time = 0.0
+    end_candidate_time = 0.0
+    rearm_stable_since = 0.0
 
     while time.monotonic() < end_time and not stop_event.is_set():
         now = time.monotonic()
         for stream in streams.values():
             stream.check_error()
+        triggered = activity_triggered(streams, baseline, now, args)
 
-        if now >= cooldown_until and activity_triggered(streams, baseline, now, args):
-            trigger_time = now
-            announce_status(f"[{trigger_time - session_start:.2f}s] gesture onset detected, capturing...")
-            capture_end_max = trigger_time + args.window_seconds
-            last_active_time = trigger_time
-            while True:
-                time.sleep(args.trigger_check_interval)
-                poll_now = time.monotonic()
-                if poll_now >= capture_end_max:
-                    break
-                if activity_triggered(streams, baseline, poll_now, args):
-                    last_active_time = poll_now
-                elif poll_now - last_active_time >= args.motion_stop_grace_seconds:
-                    break
-            window_end = min(time.monotonic(), capture_end_max)
-            captured_seconds = window_end - trigger_time
-            announce_status(f"[{window_end - session_start:.2f}s] motion stopped, captured {captured_seconds:.2f}s, classifying...")
-            capture_and_classify(window_start=trigger_time, window_end=window_end, baseline=baseline, **cycle_kwargs)
-            cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
-            last_capture_end = time.monotonic()
-            showing_gesture = True
-        elif (
-            showing_gesture
-            and args.idle_reset_seconds > 0
-            and now - last_capture_end >= args.idle_reset_seconds
-        ):
-            print(f"prediction: {NO_GESTURE_LABEL} (idle)", flush=True)
-            if gui_queue is not None:
-                gui_queue.put(
-                    {
-                        "prediction": NO_GESTURE_LABEL,
-                        "confidence": None,
-                        "time_s": now - session_start,
-                        "raw_prediction": NO_GESTURE_LABEL,
-                        "raw_confidence": None,
-                        "below_threshold": False,
-                        "vote_fraction": None,
-                        "vote_window": args.vote_window,
-                    }
+        if state == "IDLE":
+            if triggered:
+                state = "START_CONFIRMATION"
+                start_candidate_time = now
+
+        elif state == "START_CONFIRMATION":
+            if not triggered:
+                state = "IDLE"
+            elif now - start_candidate_time >= args.start_confirm_seconds:
+                gesture_start_time = start_candidate_time - args.pre_buffer_seconds
+                announce_status(f"[{start_candidate_time - session_start:.2f}s] gesture start confirmed, collecting...")
+                state = "COLLECTING"
+
+        elif state == "COLLECTING":
+            if now - gesture_start_time >= args.window_seconds:
+                gesture_end_time = gesture_start_time + args.window_seconds
+                state = "CLASSIFYING"
+            elif not triggered:
+                end_candidate_time = now
+                state = "END_CONFIRMATION"
+
+        elif state == "END_CONFIRMATION":
+            if triggered:
+                state = "COLLECTING"  # false alarm -- just a brief pause mid-gesture
+            elif now - gesture_start_time >= args.window_seconds:
+                gesture_end_time = gesture_start_time + args.window_seconds
+                state = "CLASSIFYING"
+            elif now - end_candidate_time >= args.end_confirm_seconds:
+                gesture_end_time = end_candidate_time  # trim the confirmation-period idle tail
+                state = "CLASSIFYING"
+
+        if state == "CLASSIFYING":
+            captured_seconds = gesture_end_time - gesture_start_time
+            if captured_seconds < args.min_gesture_seconds:
+                announce_status(
+                    f"[{gesture_end_time - session_start:.2f}s] discarded {captured_seconds:.2f}s capture "
+                    f"(shorter than --min-gesture-seconds {args.min_gesture_seconds:.2f}s), likely noise"
                 )
-            showing_gesture = False
+            else:
+                announce_status(
+                    f"[{gesture_end_time - session_start:.2f}s] gesture end confirmed, "
+                    f"captured {captured_seconds:.2f}s, classifying..."
+                )
+                capture_and_classify(window_start=gesture_start_time, window_end=gesture_end_time, baseline=baseline, **cycle_kwargs)
+            rearm_stable_since = 0.0
+            state = "REARM"
+
+        elif state == "REARM":
+            if triggered:
+                rearm_stable_since = 0.0
+            elif rearm_stable_since == 0.0:
+                rearm_stable_since = now
+            elif now - rearm_stable_since >= args.rearm_seconds:
+                state = "IDLE"
+                push_no_gesture(now)
 
         time.sleep(args.trigger_check_interval)
 
@@ -908,6 +1017,7 @@ def main() -> int:
             gesture_labels=labels,
             no_gesture_label=NO_GESTURE_LABEL,
             duration_s=args.duration,
+            unknown_gesture_label=UNKNOWN_GESTURE_LABEL,
         )
         gui.run(gui_queue, stop_event)
         worker.join(timeout=5)
