@@ -552,6 +552,15 @@ def capture_and_classify(
                 not_settled = True
                 break
 
+    if below_activity:
+        gate_reason = "min_activity"
+    elif not_settled:
+        gate_reason = "not_settled"
+    elif raw_confidence is not None and raw_confidence < effective_threshold:
+        gate_reason = "confidence"
+    else:
+        gate_reason = "none"
+
     below_threshold = below_threshold or below_activity or not_settled
     gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
     vote_history.append(gated_prediction)
@@ -570,6 +579,7 @@ def capture_and_classify(
             "raw_prediction": raw_prediction,
             "raw_confidence": "" if raw_confidence is None else f"{raw_confidence:.4f}",
             "gated_prediction": gated_prediction,
+            "gate_reason": gate_reason,
             "confidence_threshold": args.confidence_threshold,
             "vote_fraction": "" if vote_fraction is None else f"{vote_fraction:.4f}",
             "vote_count": len(vote_history),
@@ -782,6 +792,7 @@ def main() -> int:
                     "raw_prediction",
                     "raw_confidence",
                     "gated_prediction",
+                    "gate_reason",
                     "confidence_threshold",
                     "vote_fraction",
                     "vote_count",
