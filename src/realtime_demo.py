@@ -73,6 +73,9 @@ DEFAULT_MMWAVE_CFG = Path(__file__).resolve().parent / "mmwave" / "xwrL64xx-evm"
 # Stand-in label for predictions below --confidence-threshold. Not a real
 # trained class -- no model ever outputs this from .predict() itself.
 NO_GESTURE_LABEL = "no_gesture"
+# [shake mode] Transient display state shown for the ~--window-seconds while a
+# confirmed shake's gesture is being collected, before the real prediction is ready.
+GESTURE_STARTED_LABEL = "gesture_started"
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,7 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shake-confirm-seconds",
         type=float,
-        default=2.0,
+        default=1.5,
         help="[shake mode] Require shake_detected() to stay true for this many CONSECUTIVE seconds before "
         "actually activating a capture -- a single short flick doesn't count, you have to keep shaking. Set "
         "to 0 to activate on the very first qualifying instant, like before.",
@@ -713,14 +716,20 @@ def run_shake_capture_loop(
     a generic motion-above-baseline trigger, so ordinary movement/repositioning (or one brief
     accidental flick) can't accidentally activate a capture the way --capture-mode trigger's
     threshold can. No calibration needed (shake detection doesn't compare to an idle
-    baseline). Once confirmed, capture exactly the next --window-seconds (the shake itself
-    isn't included) and classify once, then wait out --trigger-cooldown-seconds before
-    watching for a new shake."""
+    baseline). Once confirmed: display GESTURE_STARTED_LABEL, capture exactly the next
+    --window-seconds (the shake itself isn't included), classify and display the real result,
+    hold that on screen for --trigger-cooldown-seconds, then revert the display to
+    NO_GESTURE_LABEL and go back to watching for a new shake."""
 
     def announce_status(text: str) -> None:
         print(text, flush=True)
         if gui_queue is not None:
             gui_queue.put({"_status": text})
+
+    def push_state(label: str, now: float) -> None:
+        print(f"prediction: {label}", flush=True)
+        if gui_queue is not None:
+            gui_queue.put({"prediction": label, "confidence": None, "time_s": now - session_start})
 
     if "imu" not in streams:
         raise SystemExit("--capture-mode shake needs IMU -- pass --imu-port.")
@@ -728,6 +737,7 @@ def run_shake_capture_loop(
     announce_status(
         f"Waiting for shake-to-activate (shake/flick your hand for {args.shake_confirm_seconds:.1f}s straight)..."
     )
+    push_state(NO_GESTURE_LABEL, time.monotonic())
     cooldown_until = 0.0
     shake_since: float | None = None
 
@@ -743,15 +753,16 @@ def run_shake_capture_loop(
                 shake_since = now
             elif now - shake_since >= args.shake_confirm_seconds:
                 capture_start = now
-                announce_status(
-                    f"[{capture_start - session_start:.2f}s] shake confirmed, "
-                    f"capturing next {args.window_seconds:.1f}s..."
-                )
+                announce_status(f"[{capture_start - session_start:.2f}s] shake confirmed, gesture started...")
+                push_state(GESTURE_STARTED_LABEL, capture_start)
                 capture_end = capture_start + args.window_seconds
                 while time.monotonic() < capture_end:
                     time.sleep(0.02)
                 capture_and_classify(window_start=capture_start, window_end=time.monotonic(), **cycle_kwargs)
                 cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
+                while time.monotonic() < cooldown_until:
+                    time.sleep(args.trigger_check_interval)
+                push_state(NO_GESTURE_LABEL, time.monotonic())
                 shake_since = None
         else:
             shake_since = None
