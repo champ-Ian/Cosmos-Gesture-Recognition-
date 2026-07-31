@@ -39,11 +39,15 @@ around as a baseline to compare against, not recommended for actual live use.
 
 Two different "nothing to report" outcomes, and they mean different things:
 `no_gesture` = the detector never confirmed movement at all (IDLE/REARM), or
-the classifier's own prediction was the trained "resting" class.
-`unknown_gesture` = movement WAS confirmed (a real capture happened), but
---confidence-threshold or --temporal-confirm-windows/--temporal-confirm-agreement
-couldn't get a reliable, consistent answer for which of the 15 trained
-gestures it was. Collapsing these into one label would hide the difference
+the classifier's own prediction was the trained "resting" class AND cleared
+--confidence-threshold (or that label's --class-confidence-threshold override)
+for it -- a resting guess that DIDN'T clear its own threshold is treated as
+ambiguous instead (see unknown_gesture below), not assumed to mean nothing
+happened. `unknown_gesture` = movement WAS confirmed (a real capture
+happened), but --confidence-threshold or
+--temporal-confirm-windows/--temporal-confirm-agreement couldn't get a
+reliable, consistent answer for which of the 15 trained gestures (or
+resting) it was. Collapsing these into one label would hide the difference
 between "you didn't do anything" and "you did something, we're just not sure
 what" -- worth keeping separate rather than convenient to merge.
 
@@ -131,12 +135,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--confidence-threshold",
         type=float,
-        default=0.5,
+        default=0.4,
         help=(
             "Predictions with confidence below this are reported as 'unknown_gesture' instead of the raw "
             "guess -- movement was already confirmed by the detector, the classifier just isn't sure which "
             "gesture it was, which is different from no movement having happened at all (see 'no_gesture' vs "
-            "'unknown_gesture' in the module docstring). Set to 0 to disable (always show the raw guess)."
+            "'unknown_gesture' in the module docstring). Lowered from an earlier 0.5: held-out offline "
+            "evaluation shows CORRECT predictions are almost always near-certain (>=0.88), so this mostly "
+            "affects live predictions sitting in an uncertain middle ground due to live/offline window "
+            "mismatch, not genuinely wrong guesses (those tend to be confidently wrong either way). Set to "
+            "0 to disable (always show the raw guess)."
         ),
     )
     parser.add_argument(
@@ -229,7 +237,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-gesture-seconds",
         type=float,
-        default=1.0,
+        default=0.8,
         help="[trigger mode] Checked against the ACTUAL confirmed motion duration (gesture_start_time to the "
         "instant 'No Gesture' was first seen in END_CONFIRMATION) -- shorter than this is discarded as noise "
         "before ever being classified. NOTE: confirmed motion duration can never be less than "
@@ -237,9 +245,10 @@ def parse_args() -> argparse.Namespace:
         "in the first place) -- keep this comfortably ABOVE that sum, or it can never actually discard "
         "anything. Does not limit how much data gets classified for a real gesture; see "
         "--window-seconds for that (every classified capture is a full --window-seconds clip, matching the "
-        "fixed duration training trials were recorded at). Raised from an earlier 0.3s: with "
-        "--start-confirm-seconds + --pre-buffer-seconds alone already contributing ~0.6s, 0.3s was barely "
-        "filtering anything.",
+        "fixed duration training trials were recorded at). 0.8s is a middle ground: comfortably above the "
+        "~0.6s start-confirm+pre-buffer floor (so it still actually filters noise, unlike an earlier 0.3s "
+        "default that couldn't), but lower than an earlier 1.0s that risked discarding real, quick gesture "
+        "attempts before they were ever classified.",
     )
     parser.add_argument(
         "--temporal-confirm-windows",
@@ -607,10 +616,21 @@ def capture_and_classify(
     if result is None:
         return
     raw_prediction, raw_confidence = result
-    if raw_prediction == "resting":
-        raw_prediction = NO_GESTURE_LABEL
+    # Threshold lookup uses the ORIGINAL class name (so --class-confidence-threshold
+    # resting=X actually has something to attach to) -- computed before the
+    # resting->NO_GESTURE_LABEL rename below, not after.
     effective_threshold = args.class_confidence_thresholds.get(raw_prediction, args.confidence_threshold)
     below_threshold = raw_confidence is not None and raw_confidence < effective_threshold
+    if raw_prediction == "resting" and not below_threshold:
+        # A CONFIDENT "resting" prediction is a real, meaningful answer -- the model
+        # is clearly recognizing the trained resting/idle signature, equivalent to "no
+        # gesture." A low-confidence "resting" guess, though, no longer gets the same
+        # free pass: movement was already confirmed by the state machine before this
+        # function was ever called, so an unsure "maybe resting" is genuinely
+        # ambiguous, not a confident absence of a gesture -- it falls through to the
+        # same below_threshold handling as any other uncertain class (-> unknown_gesture),
+        # instead of being assumed to mean "definitely nothing happened."
+        raw_prediction = NO_GESTURE_LABEL
 
     not_confirmed = False
     agreeing, sub_predictions = 1, [raw_prediction]
