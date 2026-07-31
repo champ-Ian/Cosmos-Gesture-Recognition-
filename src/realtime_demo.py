@@ -203,11 +203,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--end-confirm-seconds",
         type=float,
-        default=0.5,
+        default=0.8,
         help="[trigger mode] COLLECTING -> CLASSIFYING only happens after the detector says 'No Gesture' for "
         "this many CONSECUTIVE seconds (END_CONFIRMATION). If activity resumes before that, it's treated as a "
         "brief pause mid-gesture, not a real end, and collection continues rather than splitting into two "
-        "captures. The confirmation-period idle tail itself is trimmed back off before classifying.",
+        "captures. The confirmation-period idle tail itself is trimmed back off before classifying. Kept "
+        "fairly generous (0.8s, up from an earlier 0.5s) since a lower value let brief mid-gesture lulls end "
+        "capture early, producing windows much shorter than the ~3s trials the model trained on -- short "
+        "captures don't resemble training data timing-wise even when the gesture itself was performed "
+        "correctly, which reads as frequent 'unknown_gesture' rather than a wrong-but-confident guess.",
     )
     parser.add_argument(
         "--rearm-seconds",
@@ -220,9 +224,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-gesture-seconds",
         type=float,
-        default=0.3,
+        default=0.6,
         help="[trigger mode] If a confirmed gesture (after pre-buffer, before end-trim) is shorter than this, "
-        "discard it as noise instead of classifying -- too short to be a real gesture attempt.",
+        "discard it as noise instead of classifying -- too short to be a real gesture attempt. Raised from an "
+        "earlier 0.3s: with --start-confirm-seconds + --pre-buffer-seconds alone already contributing ~0.6s, "
+        "0.3s was barely filtering anything -- this now actually screens out captures too brief to resemble "
+        "the ~3s training trials, instead of letting them through to be weakly/inconsistently classified.",
     )
     parser.add_argument(
         "--temporal-confirm-windows",
@@ -650,6 +657,7 @@ def capture_and_classify(
             "gated_prediction": gated_prediction,
             "gate_reason": gate_reason,
             "confidence_threshold": args.confidence_threshold,
+            "captured_seconds": f"{window_end - window_start:.3f}",
             "vote_fraction": "" if vote_fraction is None else f"{vote_fraction:.4f}",
             "vote_count": len(vote_history),
             "vote_window": args.vote_window,
@@ -941,6 +949,7 @@ def main() -> int:
                     "gated_prediction",
                     "gate_reason",
                     "confidence_threshold",
+                    "captured_seconds",
                     "vote_fraction",
                     "vote_count",
                     "vote_window",
