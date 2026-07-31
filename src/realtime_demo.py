@@ -76,6 +76,10 @@ NO_GESTURE_LABEL = "no_gesture"
 # [shake mode] Transient display state shown for the ~--window-seconds while a
 # confirmed shake's gesture is being collected, before the real prediction is ready.
 GESTURE_STARTED_LABEL = "gesture_started"
+# [shake mode] Transient display state shown for --shake-settle-seconds right after a
+# shake is confirmed but before data collection actually starts -- nothing is being
+# recorded yet during this state, it's purely a settle gap.
+GESTURE_READY_LABEL = "gesture_ready"
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,10 +166,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shake-confirm-seconds",
         type=float,
-        default=1.5,
+        default=1.0,
         help="[shake mode] Require shake_detected() to stay true for this many CONSECUTIVE seconds before "
         "actually activating a capture -- a single short flick doesn't count, you have to keep shaking. Set "
         "to 0 to activate on the very first qualifying instant, like before.",
+    )
+    parser.add_argument(
+        "--shake-settle-seconds",
+        type=float,
+        default=0.5,
+        help="[shake mode] After a shake is confirmed, wait this long (displaying GESTURE_READY_LABEL, "
+        "NOT yet collecting any data) before the actual --window-seconds capture starts -- lets the shake's "
+        "own decaying momentum/vibration settle out first, so the tail of the shake itself doesn't leak into "
+        "the captured gesture window. Set to 0 to start collecting immediately when confirmed, like before.",
     )
     parser.add_argument(
         "--calibration-seconds",
@@ -716,10 +729,12 @@ def run_shake_capture_loop(
     a generic motion-above-baseline trigger, so ordinary movement/repositioning (or one brief
     accidental flick) can't accidentally activate a capture the way --capture-mode trigger's
     threshold can. No calibration needed (shake detection doesn't compare to an idle
-    baseline). Once confirmed: display GESTURE_STARTED_LABEL, capture exactly the next
-    --window-seconds (the shake itself isn't included), classify and display the real result,
-    hold that on screen for --trigger-cooldown-seconds, then revert the display to
-    NO_GESTURE_LABEL and go back to watching for a new shake."""
+    baseline). Once confirmed: display GESTURE_READY_LABEL for --shake-settle-seconds (NOT
+    collecting anything yet -- lets the shake's own decaying momentum settle out first, so it
+    doesn't leak into the captured gesture), then display GESTURE_STARTED_LABEL and capture
+    exactly the next --window-seconds, classify and display the real result, hold that on
+    screen for --trigger-cooldown-seconds, then revert the display to NO_GESTURE_LABEL and go
+    back to watching for a new shake."""
 
     def announce_status(text: str) -> None:
         print(text, flush=True)
@@ -752,8 +767,15 @@ def run_shake_capture_loop(
             if shake_since is None:
                 shake_since = now
             elif now - shake_since >= args.shake_confirm_seconds:
-                capture_start = now
-                announce_status(f"[{capture_start - session_start:.2f}s] shake confirmed, gesture started...")
+                confirmed_at = now
+                announce_status(f"[{confirmed_at - session_start:.2f}s] shake confirmed, gesture ready...")
+                push_state(GESTURE_READY_LABEL, confirmed_at)
+                settle_until = confirmed_at + args.shake_settle_seconds
+                while time.monotonic() < settle_until:
+                    time.sleep(args.trigger_check_interval)
+
+                capture_start = time.monotonic()
+                announce_status(f"[{capture_start - session_start:.2f}s] gesture started, collecting...")
                 push_state(GESTURE_STARTED_LABEL, capture_start)
                 capture_end = capture_start + args.window_seconds
                 while time.monotonic() < capture_end:
