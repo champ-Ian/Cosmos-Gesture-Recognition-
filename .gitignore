@@ -25,5 +25,4 @@ logs/
 *.npz
 *.confusion.png
 *.json
-*.joblib
-raw/
+åraw/
