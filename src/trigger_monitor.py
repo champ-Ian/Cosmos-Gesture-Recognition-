@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
-Standalone diagnostic: continuously shows "GESTURE" the instant any sensor's
-activity crosses --trigger-z-threshold std-devs above its calibrated idle
-baseline, and "no gesture" otherwise -- updating live, independent of the
-slower window-seconds capture+classify cycle realtime_demo.py uses.
+Standalone diagnostic: continuously shows "ACTIVE" the instant a detector
+fires, and "idle" otherwise -- updating live, independent of the slower
+window-seconds capture+classify cycle realtime_demo.py uses.
 
-This directly answers "when does it actually start recording": it shows the
-literal live trigger condition (the same activity_triggered() check
-realtime_demo.py's trigger mode uses to decide when to start a capture), with
-no model, no classification, and no window-length delay in the way -- pure
-timing verification of the trigger mechanism by itself. Move/gesture and
-watch the console or --gui window -- the state should flip to GESTURE the
-moment you start moving, and back to "no gesture" once you stop.
+Two detectors to test, pick with --detector:
+  'activity' (default) -- realtime_demo.py's --capture-mode trigger mechanism:
+    any sensor's activity crossing --trigger-z-threshold std-devs above a
+    calibrated idle baseline. Shown as GESTURE / no gesture.
+  'shake' -- realtime_demo.py's --capture-mode shake mechanism: a rapid IMU
+    oscillation (shake_detected()), no baseline needed. Shown as SHAKE / no shake.
+
+This directly answers "when does it actually start recording" for whichever
+one you're testing: it shows the literal live detector condition, with no
+model, no classification, and no window-length delay in the way -- pure
+timing verification of the detection mechanism by itself. Move/shake and
+watch the console or --gui window -- the state should flip the moment you
+start, and back once you stop.
 
 Run from the repo root:
     python src/trigger_monitor.py \\
         --mmwave-port /dev/cu.usbserial-XXXX --imu-port /dev/cu.usbserial-YYYY \\
         --uwb-anchor-port /dev/cu.usbmodemAAAA --uwb-node-port /dev/cu.usbmodemBBBB \\
-        --uwb-group-id 1 --duration 60 --gui
+        --uwb-group-id 1 --duration 60 --detector shake --gui
 """
 from __future__ import annotations
 
@@ -33,6 +38,7 @@ from realtime_demo import (
     calibrate_idle_baseline,
     close_streams,
     open_streams,
+    shake_detected,
 )
 from sensors.common import REPO_DIR
 
@@ -47,13 +53,28 @@ LIVE_GREEN = "#2ecc71"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--duration", type=float, default=60.0, help="Seconds to monitor.")
-    parser.add_argument("--calibration-seconds", type=float, default=2.0, help="Idle period at startup -- stay still.")
-    parser.add_argument("--trigger-window-seconds", type=float, default=0.4)
+    parser.add_argument(
+        "--detector",
+        choices=["activity", "shake"],
+        default="activity",
+        help="Which realtime_demo.py detector to test: 'activity' = --capture-mode trigger's motion-above-"
+        "baseline check; 'shake' = --capture-mode shake's rapid-oscillation check.",
+    )
+    parser.add_argument("--calibration-seconds", type=float, default=2.0, help="[activity detector] Idle period "
+        "at startup -- stay still. Not used for --detector shake (no baseline needed).")
+    parser.add_argument("--trigger-window-seconds", type=float, default=0.4, help="[activity detector]")
     parser.add_argument("--trigger-check-interval", type=float, default=0.05, help="Faster than realtime_demo.py's "
         "default -- this script isn't doing any capture/classify work, so it can poll quickly.")
-    parser.add_argument("--trigger-z-threshold", type=float, default=3.0, help="Same meaning as realtime_demo.py's "
-        "--trigger-z-threshold -- match whatever value you're actually using there to test the same sensitivity.")
-    parser.add_argument("--gui", action="store_true", help="Show a big color-coded GESTURE/no gesture window "
+    parser.add_argument("--trigger-z-threshold", type=float, default=3.0, help="[activity detector] Same meaning "
+        "as realtime_demo.py's --trigger-z-threshold -- match whatever value you're actually using there.")
+    parser.add_argument("--shake-window-seconds", type=float, default=0.6, help="[shake detector] Same meaning "
+        "as realtime_demo.py's --shake-window-seconds.")
+    parser.add_argument("--shake-min-crossings-per-second", type=float, default=6.0, help="[shake detector] Same "
+        "meaning as realtime_demo.py's --shake-min-crossings-per-second -- match whatever value you're actually "
+        "using there.")
+    parser.add_argument("--shake-min-amplitude", type=float, default=0.3, help="[shake detector] Same meaning as "
+        "realtime_demo.py's --shake-min-amplitude.")
+    parser.add_argument("--gui", action="store_true", help="Show a big color-coded ACTIVE/idle window "
         "instead of terminal-only output.")
 
     mmwave_group = parser.add_argument_group("mmWave radar (TI xWRL6432)")
@@ -86,18 +107,20 @@ def parse_args() -> argparse.Namespace:
 
 
 class TriggerMonitorGUI:
-    """Minimal Tkinter window: one big color-coded GESTURE / no gesture label
-    plus a status line. Deliberately much simpler than realtime_gui.py's
+    """Minimal Tkinter window: one big color-coded ACTIVE / idle label plus a
+    status line. Deliberately much simpler than realtime_gui.py's
     RealtimeGestureGUI -- there's only two states here, not 15 gesture labels
     to color/tally."""
 
-    def __init__(self) -> None:
+    def __init__(self, active_label: str, idle_label: str, title: str) -> None:
         import tkinter as tk
         from tkinter import font as tkfont
 
         self.tk = tk
+        self.active_label = active_label
+        self.idle_label = idle_label
         self.root = tk.Tk()
-        self.root.title("Trigger Monitor -- GESTURE vs no gesture")
+        self.root.title(title)
         self.root.configure(bg=BG)
         self.root.geometry("560x360")
         self.root.minsize(420, 280)
@@ -116,10 +139,10 @@ class TriggerMonitorGUI:
         self.timer_label.pack(pady=(0, 20))
 
     def _set_state(self, state: str) -> None:
-        if state == "GESTURE":
-            self.state_label.configure(text="GESTURE", fg=LIVE_GREEN)
-        elif state == "no gesture":
-            self.state_label.configure(text="no gesture", fg=TEXT_BRIGHT)
+        if state == self.active_label:
+            self.state_label.configure(text=self.active_label, fg=LIVE_GREEN)
+        elif state == self.idle_label:
+            self.state_label.configure(text=self.idle_label, fg=TEXT_BRIGHT)
         else:
             self.state_label.configure(text=state, fg=TEXT_DIM)
 
@@ -157,13 +180,22 @@ def run_monitor_loop(
     args: argparse.Namespace,
     stop_event: threading.Event,
     gui_queue: "queue.Queue | None",
+    active_label: str,
+    idle_label: str,
 ) -> None:
-    baseline = calibrate_idle_baseline(streams, args)
-    baseline_text = "Baseline: " + ", ".join(f"{sensor}={mean:.2f}±{std:.2f}" for sensor, (mean, std) in baseline.items())
-    print(baseline_text)
-    print(f"Live trigger state (z >= {args.trigger_z_threshold}) -- move to test, Ctrl+C to stop:")
-    if gui_queue is not None:
-        gui_queue.put({"_status": f"z >= {args.trigger_z_threshold} -- move to test"})
+    if args.detector == "shake":
+        baseline = None
+        print(f"Live shake state (>= {args.shake_min_crossings_per_second}/s crossings, "
+              f">= {args.shake_min_amplitude}g amplitude) -- shake to test, Ctrl+C to stop:")
+        if gui_queue is not None:
+            gui_queue.put({"_status": f">= {args.shake_min_crossings_per_second}/s crossings -- shake to test"})
+    else:
+        baseline = calibrate_idle_baseline(streams, args)
+        baseline_text = "Baseline: " + ", ".join(f"{sensor}={mean:.2f}±{std:.2f}" for sensor, (mean, std) in baseline.items())
+        print(baseline_text)
+        print(f"Live trigger state (z >= {args.trigger_z_threshold}) -- move to test, Ctrl+C to stop:")
+        if gui_queue is not None:
+            gui_queue.put({"_status": f"z >= {args.trigger_z_threshold} -- move to test"})
 
     start = time.monotonic()
     end_time = start + args.duration
@@ -173,8 +205,11 @@ def run_monitor_loop(
             now = time.monotonic()
             for stream in streams.values():
                 stream.check_error()
-            triggered = activity_triggered(streams, baseline, now, args)
-            new_state = "GESTURE" if triggered else "no gesture"
+            if args.detector == "shake":
+                triggered = shake_detected(streams, now, args)
+            else:
+                triggered = activity_triggered(streams, baseline, now, args)
+            new_state = active_label if triggered else idle_label
             if new_state != state:
                 state = new_state
                 elapsed = now - start
@@ -207,6 +242,11 @@ def main() -> int:
             "Pass at least one sensor's port: --mmwave-port / --imu-port / "
             "(--uwb-anchor-port + --uwb-node-port) / --rfid."
         )
+    if args.detector == "shake" and "imu" not in required_sensors:
+        raise SystemExit("--detector shake needs IMU -- pass --imu-port.")
+
+    active_label, idle_label = ("SHAKE", "no shake") if args.detector == "shake" else ("GESTURE", "no gesture")
+    title = f"Trigger Monitor -- {active_label} vs {idle_label}"
 
     session_dir = REPO_DIR / "sessions" / "trigger_monitor_tmp"
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -216,14 +256,18 @@ def main() -> int:
     try:
         if args.gui:
             gui_queue: "queue.Queue" = queue.Queue()
-            worker = threading.Thread(target=run_monitor_loop, args=(streams, args, stop_event, gui_queue), daemon=True)
+            worker = threading.Thread(
+                target=run_monitor_loop,
+                args=(streams, args, stop_event, gui_queue, active_label, idle_label),
+                daemon=True,
+            )
             worker.start()
-            gui = TriggerMonitorGUI()
+            gui = TriggerMonitorGUI(active_label, idle_label, title)
             gui.run(gui_queue, stop_event)
             stop_event.set()
             worker.join(timeout=2)
         else:
-            run_monitor_loop(streams, args, stop_event, None)
+            run_monitor_loop(streams, args, stop_event, None, active_label, idle_label)
     finally:
         close_streams(streams)
     return 0
