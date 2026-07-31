@@ -519,6 +519,8 @@ def capture_and_classify(
     if result is None:
         return
     raw_prediction, raw_confidence = result
+    if raw_prediction == "resting":
+        raw_prediction = NO_GESTURE_LABEL
     effective_threshold = args.class_confidence_thresholds.get(raw_prediction, args.confidence_threshold)
     below_threshold = raw_confidence is not None and raw_confidence < effective_threshold
 
