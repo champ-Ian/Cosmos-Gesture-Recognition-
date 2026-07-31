@@ -25,4 +25,5 @@ logs/
 *.npz
 *.confusion.png
 *.json
-åraw/
+*.joblib
+raw/
