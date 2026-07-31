@@ -23,10 +23,14 @@ single noisy detector tick can't start or end a capture on its own (that
 needs --start-confirm-seconds / --end-confirm-seconds of SUSTAINED agreement
 first); a --pre-buffer-seconds back-dates the captured window's start so the
 very beginning of the gesture -- which happens before the detector can
-confirm it -- isn't lost; and the confirmation-period idle tail at the end
-gets trimmed off before classifying, so the captured window is closer to what
-training data actually looked like (see extract_features.py) than a blind
-fixed-length window would be.
+confirm it -- isn't lost; and once a real gesture is confirmed (long enough
+to clear --min-gesture-seconds, not just noise), the classified window is a
+full --window-seconds clip from the confirmed start, matching the FIXED
+duration every training trial was collected at (see collect.py/
+extract_features.py) -- NOT trimmed down to just the confirmed motion span,
+since real training trials include natural pre/post-motion stillness within
+their labeled duration too, and a motion-trimmed capture -- however tidy --
+doesn't resemble that.
 
 `--capture-mode interval` is the older, simpler alternative: predicts every
 `--step-seconds` on a fixed-length sliding window regardless of what's
@@ -113,8 +117,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Model .joblib from train.py.")
     parser.add_argument("--duration", type=float, default=60.0, help="Seconds to run the live session.")
     parser.add_argument("--window-seconds", type=float, default=3.0, help="Sliding feature-extraction window "
-        "(interval mode). In --capture-mode trigger, this is a hard MAX duration cap on one COLLECTING "
-        "episode -- actual captured length is usually shorter, bounded by --end-confirm-seconds instead.")
+        "(interval mode). In --capture-mode trigger, this is BOTH a hard MAX duration cap on one COLLECTING "
+        "episode AND the fixed duration every confirmed (non-noise) gesture gets classified at, matching how "
+        "training trials were recorded -- not trimmed down to just the confirmed motion span. Keep this close "
+        "to your training trial duration (see collect.py's --duration / --segment-length).")
     parser.add_argument("--step-seconds", type=float, default=0.5, help="Seconds between predictions (interval mode).")
     parser.add_argument(
         "--vote-window",
@@ -207,11 +213,10 @@ def parse_args() -> argparse.Namespace:
         help="[trigger mode] COLLECTING -> CLASSIFYING only happens after the detector says 'No Gesture' for "
         "this many CONSECUTIVE seconds (END_CONFIRMATION). If activity resumes before that, it's treated as a "
         "brief pause mid-gesture, not a real end, and collection continues rather than splitting into two "
-        "captures. The confirmation-period idle tail itself is trimmed back off before classifying. Kept "
-        "fairly generous (0.8s, up from an earlier 0.5s) since a lower value let brief mid-gesture lulls end "
-        "capture early, producing windows much shorter than the ~3s trials the model trained on -- short "
-        "captures don't resemble training data timing-wise even when the gesture itself was performed "
-        "correctly, which reads as frequent 'unknown_gesture' rather than a wrong-but-confident guess.",
+        "captures. Decides WHEN a gesture is considered over (and, via the confirmed motion duration, whether "
+        "--min-gesture-seconds treats it as noise) -- it does NOT determine how much data gets classified; "
+        "see --window-seconds for that. Kept fairly generous (0.8s, up from an earlier 0.5s) so a brief "
+        "mid-gesture lull doesn't get mistaken for the real end.",
     )
     parser.add_argument(
         "--rearm-seconds",
@@ -224,12 +229,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-gesture-seconds",
         type=float,
-        default=0.6,
-        help="[trigger mode] If a confirmed gesture (after pre-buffer, before end-trim) is shorter than this, "
-        "discard it as noise instead of classifying -- too short to be a real gesture attempt. Raised from an "
-        "earlier 0.3s: with --start-confirm-seconds + --pre-buffer-seconds alone already contributing ~0.6s, "
-        "0.3s was barely filtering anything -- this now actually screens out captures too brief to resemble "
-        "the ~3s training trials, instead of letting them through to be weakly/inconsistently classified.",
+        default=1.0,
+        help="[trigger mode] Checked against the ACTUAL confirmed motion duration (gesture_start_time to the "
+        "instant 'No Gesture' was first seen in END_CONFIRMATION) -- shorter than this is discarded as noise "
+        "before ever being classified. NOTE: confirmed motion duration can never be less than "
+        "--start-confirm-seconds + --pre-buffer-seconds (anything shorter never survives START_CONFIRMATION "
+        "in the first place) -- keep this comfortably ABOVE that sum, or it can never actually discard "
+        "anything. Does not limit how much data gets classified for a real gesture; see "
+        "--window-seconds for that (every classified capture is a full --window-seconds clip, matching the "
+        "fixed duration training trials were recorded at). Raised from an earlier 0.3s: with "
+        "--start-confirm-seconds + --pre-buffer-seconds alone already contributing ~0.6s, 0.3s was barely "
+        "filtering anything.",
     )
     parser.add_argument(
         "--temporal-confirm-windows",
@@ -778,12 +788,24 @@ def run_trigger_state_machine(
     --end-confirm-seconds STRAIGHT before the gesture is considered over -- if
     it flips back to "Gesture" first, that was a brief pause mid-gesture, not
     the end, and COLLECTING resumes instead of splitting one gesture into two
-    captures. Once confirmed, the window's end is trimmed back to the instant
-    "No Gesture" was FIRST seen, so the confirmation period's own idle time
-    isn't included in what gets classified.
+    captures. Once confirmed, the ACTUAL confirmed motion duration (from
+    gesture_start_time to the instant "No Gesture" was first seen) is checked
+    against --min-gesture-seconds -- too short and it's discarded as noise
+    right here, without ever being classified. If it's long enough to be real,
+    the window that actually gets classified is NOT trimmed to that motion
+    span -- it's expanded to a full --window-seconds clip from the confirmed
+    start, matching the fixed duration every training trial was recorded at
+    (see collect.py/extract_features.py). Training trials include natural
+    pre/post-motion stillness within their labeled duration, so a
+    motion-trimmed capture, however tidy, is shorter than and doesn't
+    resemble anything the model has seen -- CLASSIFYING then has to wait
+    (real time, not instantly) until that full window has actually elapsed
+    before there's enough buffered data to extract it.
 
-    CLASSIFYING: captures shorter than --min-gesture-seconds are discarded as
-    noise; everything else goes through `capture_and_classify` exactly once.
+    CLASSIFYING: waits for the full --window-seconds window (from
+    gesture_start_time) to actually elapse, then runs `capture_and_classify`
+    exactly once. (Noise-length captures never reach this state at all --
+    see END_CONFIRMATION above.)
 
     REARM: after a result is shown (or a too-short capture discarded),
     require --rearm-seconds of CONTINUOUS confirmed "No Gesture" before
@@ -856,24 +878,41 @@ def run_trigger_state_machine(
                 gesture_end_time = gesture_start_time + args.window_seconds
                 state = "CLASSIFYING"
             elif now - end_candidate_time >= args.end_confirm_seconds:
-                gesture_end_time = end_candidate_time  # trim the confirmation-period idle tail
-                state = "CLASSIFYING"
+                confirmed_motion_seconds = end_candidate_time - gesture_start_time
+                if confirmed_motion_seconds < args.min_gesture_seconds:
+                    # Too brief to be a real gesture attempt -- discard as noise here, based on
+                    # how long motion was actually confirmed, rather than expanding it into a
+                    # full window and letting the classifier guess at what's likely nothing.
+                    announce_status(
+                        f"[{end_candidate_time - session_start:.2f}s] discarded {confirmed_motion_seconds:.2f}s "
+                        f"capture (shorter than --min-gesture-seconds {args.min_gesture_seconds:.2f}s), likely noise"
+                    )
+                    rearm_stable_since = 0.0
+                    state = "REARM"
+                else:
+                    # Classify a full --window-seconds window from the confirmed start, NOT
+                    # trimmed to end_candidate_time. Every training trial (see extract_features.py
+                    # / collect.py) is a fixed-duration clip regardless of how fast the real
+                    # motion finished within it, so a motion-trimmed capture -- however tidy --
+                    # doesn't resemble anything the model actually trained on. Start/end
+                    # confirmation still decide WHEN a real gesture happened (and filter noise via
+                    # min_gesture_seconds above); this only changes how much data gets classified
+                    # once that's decided.
+                    gesture_end_time = gesture_start_time + args.window_seconds
+                    state = "CLASSIFYING"
 
         if state == "CLASSIFYING":
-            captured_seconds = gesture_end_time - gesture_start_time
-            if captured_seconds < args.min_gesture_seconds:
-                announce_status(
-                    f"[{gesture_end_time - session_start:.2f}s] discarded {captured_seconds:.2f}s capture "
-                    f"(shorter than --min-gesture-seconds {args.min_gesture_seconds:.2f}s), likely noise"
-                )
+            if now < gesture_end_time:
+                pass  # keep waiting for the full fixed window to actually fill before classifying
             else:
+                captured_seconds = gesture_end_time - gesture_start_time
                 announce_status(
                     f"[{gesture_end_time - session_start:.2f}s] gesture end confirmed, "
                     f"captured {captured_seconds:.2f}s, classifying..."
                 )
                 capture_and_classify(window_start=gesture_start_time, window_end=gesture_end_time, baseline=baseline, **cycle_kwargs)
-            rearm_stable_since = 0.0
-            state = "REARM"
+                rearm_stable_since = 0.0
+                state = "REARM"
 
         elif state == "REARM":
             if triggered:
