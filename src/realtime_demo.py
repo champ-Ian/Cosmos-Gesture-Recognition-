@@ -456,6 +456,8 @@ def capture_and_classify(
     if result is None:
         return
     raw_prediction, raw_confidence = result
+    if raw_prediction == "resting":
+        raw_prediction = NO_GESTURE_LABEL
     below_threshold = raw_confidence is not None and raw_confidence < args.confidence_threshold
     gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
     vote_history.append(gated_prediction)
