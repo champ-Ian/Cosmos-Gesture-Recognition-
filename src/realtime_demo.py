@@ -79,7 +79,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, help="Model .joblib from train.py.")
     parser.add_argument("--duration", type=float, default=60.0, help="Seconds to run the live session.")
-    parser.add_argument("--window-seconds", type=float, default=3.0, help="Sliding feature-extraction window.")
+    parser.add_argument("--window-seconds", type=float, default=3.0, help="Sliding feature-extraction window. In "
+        "--capture-mode trigger, this is a MAX cap -- see --motion-stop-grace-seconds, capture ends early if "
+        "motion stops before this.")
+    parser.add_argument(
+        "--motion-stop-grace-seconds",
+        type=float,
+        default=0.4,
+        help="[trigger mode] Once a capture has started, if activity drops back to idle and stays there for "
+        "this long, end the capture early (rather than always waiting out the full --window-seconds) and "
+        "classify on however much was actually captured. A real gesture that finishes in 1.2s doesn't force "
+        "you to keep holding for the rest of a fixed 3s window. Set high (e.g. 100) to disable and always "
+        "capture the full --window-seconds like before.",
+    )
     parser.add_argument("--step-seconds", type=float, default=0.5, help="Seconds between predictions.")
     parser.add_argument(
         "--vote-window",
@@ -689,10 +701,12 @@ def run_trigger_state_machine(
     gui_queue: "queue.Queue | None",
 ) -> None:
     """--capture-mode trigger's loop: calibrate an idle baseline, then wait for
-    any sensor's activity to spike --trigger-z-threshold std-devs above it,
-    capture a fixed --window-seconds window starting at that trigger, classify
-    it once (via `capture_and_classify`, so it's logged/printed/GUI-pushed the
-    normal way), then hold off on watching for a new trigger until
+    any sensor's activity to spike --trigger-z-threshold std-devs above it.
+    Once triggered, keep extending the capture while motion continues, ending
+    it early (--motion-stop-grace-seconds of quiet) or at the --window-seconds
+    cap, whichever comes first, then classifies whatever was actually captured
+    (via `capture_and_classify`, so it's logged/printed/GUI-pushed the normal
+    way), then holds off on watching for a new trigger until
     --trigger-cooldown-seconds of quiet has passed."""
 
     def announce_status(text: str) -> None:
@@ -714,10 +728,21 @@ def run_trigger_state_machine(
         if now >= cooldown_until and activity_triggered(streams, baseline, now, args):
             trigger_time = now
             announce_status(f"[{trigger_time - session_start:.2f}s] gesture onset detected, capturing...")
-            capture_end = trigger_time + args.window_seconds
-            while time.monotonic() < capture_end:
-                time.sleep(0.02)
-            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), baseline=baseline, **cycle_kwargs)
+            capture_end_max = trigger_time + args.window_seconds
+            last_active_time = trigger_time
+            while True:
+                time.sleep(args.trigger_check_interval)
+                poll_now = time.monotonic()
+                if poll_now >= capture_end_max:
+                    break
+                if activity_triggered(streams, baseline, poll_now, args):
+                    last_active_time = poll_now
+                elif poll_now - last_active_time >= args.motion_stop_grace_seconds:
+                    break
+            window_end = min(time.monotonic(), capture_end_max)
+            captured_seconds = window_end - trigger_time
+            announce_status(f"[{window_end - session_start:.2f}s] motion stopped, captured {captured_seconds:.2f}s, classifying...")
+            capture_and_classify(window_start=trigger_time, window_end=window_end, baseline=baseline, **cycle_kwargs)
             cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
             last_capture_end = time.monotonic()
             showing_gesture = True
