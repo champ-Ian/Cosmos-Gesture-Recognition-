@@ -110,14 +110,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--capture-mode",
-        choices=["interval", "trigger"],
+        choices=["interval", "trigger", "shake"],
         default="interval",
         help=(
             "'interval' (default) predicts every --step-seconds regardless of what's happening -- "
             "windows constantly straddle real gesture boundaries. 'trigger' instead watches a cheap "
             "motion-activity signal and only captures+classifies once it spikes above an idle "
-            "baseline, so the window is roughly gesture-bounded like training data was."
+            "baseline, so the window is roughly gesture-bounded like training data was. 'shake' is a "
+            "deliberate wake-gesture instead: do nothing until you rapidly shake/flick your hand, which "
+            "has a distinctive fast-oscillating signature unlike any of the 15 real gestures or ordinary "
+            "movement, then it captures the next --window-seconds and classifies that (the shake itself "
+            "isn't included -- it's a control signal, not part of the gesture)."
         ),
+    )
+    parser.add_argument(
+        "--shake-window-seconds",
+        type=float,
+        default=0.6,
+        help="[shake mode] Lookback window used to detect a shake -- how much recent IMU history to check "
+        "for rapid oscillation.",
+    )
+    parser.add_argument(
+        "--shake-min-crossings-per-second",
+        type=float,
+        default=6.0,
+        help="[shake mode] Minimum rate (per second) at which acceleration magnitude must cross its own "
+        "window-mean to count as 'shaking' rather than a normal, smoother gesture motion. A real rapid "
+        "shake is a few Hz of back-and-forth, so each cycle crosses the mean twice -- tune this live, same "
+        "as --trigger-z-threshold, by watching what your actual shake vs. a real gesture score.",
+    )
+    parser.add_argument(
+        "--shake-min-amplitude",
+        type=float,
+        default=0.3,
+        help="[shake mode] Minimum standard deviation of acceleration magnitude (in g) within the lookback "
+        "window required to even consider it a shake -- rejects a fast-but-tiny wiggle/noise from counting.",
     )
     parser.add_argument(
         "--calibration-seconds",
@@ -567,6 +594,30 @@ def activity_triggered(streams: dict, baseline: dict[str, tuple[float, float]], 
     return False
 
 
+def shake_detected(streams: dict, now: float, args: argparse.Namespace) -> bool:
+    """[shake mode] True if the IMU shows a rapid, oscillating shake pattern in the last
+    --shake-window-seconds -- a deliberate 'start recording' wake gesture, distinct from a
+    real gesture's smoother, lower-frequency motion. No idle baseline needed (unlike
+    activity_triggered): shakes are detected by how fast acceleration magnitude oscillates
+    around its OWN window mean (zero-crossing rate), not by comparing to a calibrated resting
+    level, plus a minimum amplitude floor so a fast-but-tiny wiggle doesn't count."""
+    if "imu" not in streams:
+        return False
+    window_start = now - args.shake_window_seconds
+    window = streams["imu"].window(window_start, now)
+    samples = [parse_imu_line(line) for _, line in window]
+    samples = [s for s in samples if s is not None]
+    if len(samples) < 6:
+        return False
+    accel_mag = np.linalg.norm(np.array(samples)[:, :3], axis=1)
+    if np.std(accel_mag) < args.shake_min_amplitude:
+        return False
+    centered = accel_mag - np.mean(accel_mag)
+    crossings = int(np.sum(np.diff(np.sign(centered)) != 0))
+    crossing_rate = crossings / args.shake_window_seconds
+    return crossing_rate >= args.shake_min_crossings_per_second
+
+
 def run_trigger_state_machine(
     streams: dict,
     args: argparse.Namespace,
@@ -605,6 +656,54 @@ def run_trigger_state_machine(
             while time.monotonic() < capture_end:
                 time.sleep(0.02)
             capture_and_classify(window_start=window_start, window_end=time.monotonic(), **cycle_kwargs)
+            cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
+
+        time.sleep(args.trigger_check_interval)
+
+
+def run_shake_capture_loop(
+    streams: dict,
+    args: argparse.Namespace,
+    session_start: float,
+    end_time: float,
+    stop_event: threading.Event,
+    cycle_kwargs: dict,
+    gui_queue: "queue.Queue | None",
+) -> None:
+    """--capture-mode shake's loop: do nothing until shake_detected() fires -- a deliberate
+    'start recording' wake gesture instead of a generic motion-above-baseline trigger, so
+    ordinary movement/repositioning can't accidentally activate a capture the way
+    --capture-mode trigger's threshold can. No calibration needed (shake detection doesn't
+    compare to an idle baseline). Once detected, capture exactly the next --window-seconds
+    (the shake itself isn't included) and classify once, then wait out
+    --trigger-cooldown-seconds before watching for a new shake."""
+
+    def announce_status(text: str) -> None:
+        print(text, flush=True)
+        if gui_queue is not None:
+            gui_queue.put({"_status": text})
+
+    if "imu" not in streams:
+        raise SystemExit("--capture-mode shake needs IMU -- pass --imu-port.")
+
+    announce_status("Waiting for shake-to-activate (flick/shake your hand rapidly)...")
+    cooldown_until = 0.0
+
+    while time.monotonic() < end_time and not stop_event.is_set():
+        now = time.monotonic()
+        for stream in streams.values():
+            stream.check_error()
+
+        if now >= cooldown_until and shake_detected(streams, now, args):
+            capture_start = now
+            announce_status(
+                f"[{capture_start - session_start:.2f}s] shake detected, "
+                f"capturing next {args.window_seconds:.1f}s..."
+            )
+            capture_end = capture_start + args.window_seconds
+            while time.monotonic() < capture_end:
+                time.sleep(0.02)
+            capture_and_classify(window_start=capture_start, window_end=time.monotonic(), **cycle_kwargs)
             cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
 
         time.sleep(args.trigger_check_interval)
@@ -701,6 +800,16 @@ def main() -> int:
             try:
                 if args.capture_mode == "trigger":
                     run_trigger_state_machine(
+                        streams=streams,
+                        args=args,
+                        session_start=session_start,
+                        end_time=end_time,
+                        stop_event=stop_event,
+                        cycle_kwargs=cycle_kwargs,
+                        gui_queue=gui_queue,
+                    )
+                elif args.capture_mode == "shake":
+                    run_shake_capture_loop(
                         streams=streams,
                         args=args,
                         session_start=session_start,
