@@ -79,7 +79,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, help="Model .joblib from train.py.")
     parser.add_argument("--duration", type=float, default=60.0, help="Seconds to run the live session.")
-    parser.add_argument("--window-seconds", type=float, default=3.0, help="Sliding feature-extraction window.")
+    parser.add_argument("--window-seconds", type=float, default=3.0, help="Sliding feature-extraction window. In "
+        "--capture-mode trigger, this is the TOTAL captured span including --pre-buffer-seconds -- e.g. "
+        "window-seconds=3, pre-buffer-seconds=0.5 captures [trigger - 0.5s, trigger + 2.5s], still 3s total.")
+    parser.add_argument(
+        "--pre-buffer-seconds",
+        type=float,
+        default=0.5,
+        help="[trigger mode] Back-date the captured window's start by this much, recovering data from before "
+        "the trigger fired -- free to do, sensor readers keep their whole session history in memory. Matches "
+        "training data more closely: there's likely a brief beat of stillness at the very start of a training "
+        "trial too (reaction time between the 'go' signal and actually starting to move), not pure motion "
+        "from frame one. Set to 0 to disable (capture starts exactly at the trigger instant, like before).",
+    )
     parser.add_argument("--step-seconds", type=float, default=0.5, help="Seconds between predictions.")
     parser.add_argument(
         "--vote-window",
@@ -588,10 +600,11 @@ def run_trigger_state_machine(
         if now >= cooldown_until and activity_triggered(streams, baseline, now, args):
             trigger_time = now
             announce_status(f"[{trigger_time - session_start:.2f}s] gesture onset detected, capturing...")
-            capture_end = trigger_time + args.window_seconds
+            window_start = trigger_time - args.pre_buffer_seconds
+            capture_end = trigger_time + (args.window_seconds - args.pre_buffer_seconds)
             while time.monotonic() < capture_end:
                 time.sleep(0.02)
-            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
+            capture_and_classify(window_start=window_start, window_end=time.monotonic(), **cycle_kwargs)
             cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
 
         time.sleep(args.trigger_check_interval)
