@@ -97,20 +97,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--class-confidence-threshold",
-        action="append",
-        default=[],
-        metavar="LABEL=VALUE",
-        help=(
-            "Per-gesture override of --confidence-threshold, e.g. --class-confidence-threshold "
-            "one_arm_boxing=0.2 --class-confidence-threshold t_arm=0.2. Repeatable. A raw prediction "
-            "is only gated to 'no_gesture' if its confidence is below THAT label's threshold (falls "
-            "back to --confidence-threshold for any label not listed) -- lets a gesture that's "
-            "reliably correct but chronically low-confidence clear the bar without loosening the "
-            "threshold for every other gesture too."
-        ),
-    )
-    parser.add_argument(
         "--capture-mode",
         choices=["interval", "trigger"],
         default="interval",
@@ -151,43 +137,6 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="[trigger mode] Minimum quiet time after a capture before a new trigger can fire.",
     )
-    parser.add_argument(
-        "--idle-reset-seconds",
-        type=float,
-        default=2.0,
-        help="[trigger mode] If this many seconds pass with no new trigger, actively push 'no_gesture' to "
-        "the display/log instead of leaving the last real prediction frozen on screen while you're standing "
-        "still. Set to 0 to disable.",
-    )
-    parser.add_argument(
-        "--min-activity-z",
-        type=float,
-        default=2.0,
-        help="[trigger mode] After capturing a full window, require at least one sensor's activity across "
-        "the WHOLE window (not just the trigger instant) to be this many std-devs above the idle baseline, "
-        "or the prediction is forced to 'no_gesture' regardless of the model's confidence. This is a harder, "
-        "motion-based gate on top of --confidence-threshold, for when the model confidently guesses a real "
-        "gesture during near-total stillness. Set to 0 to disable.",
-    )
-    parser.add_argument(
-        "--settle-window-seconds",
-        type=float,
-        default=1.0,
-        help="[trigger mode] Length of the tail end of the captured window checked for --max-end-activity-z "
-        "-- training trials were collected as 'move into the completed pose, then hold it,' so a real "
-        "gesture should end still. Transit motion between two real gestures doesn't settle, so this catches "
-        "it even though --min-activity-z (which only checks for SOME motion somewhere) would let it through.",
-    )
-    parser.add_argument(
-        "--max-end-activity-z",
-        type=float,
-        default=1.0,
-        help="[trigger mode] If every sensor's activity in the last --settle-window-seconds of the window "
-        "is below this many std-devs above the idle baseline, the window is considered 'settled' (matches "
-        "how training trials ended). If it's still moving that late in the window, the prediction is forced "
-        "to 'no_gesture' -- this is what catches transit-time false positives. Set to a very large number "
-        "(e.g. 1000) to disable.",
-    )
     parser.add_argument("--out-root", default=str(REPO_DIR / "sessions"))
     parser.add_argument("--session-name")
     parser.add_argument(
@@ -225,18 +174,7 @@ def parse_args() -> argparse.Namespace:
     rfid_group.add_argument("--rfid-host", default="192.168.137.1")
     rfid_group.add_argument("--rfid-tcp-port", type=int, default=9055)
 
-    args = parser.parse_args()
-    args.class_confidence_thresholds = {}
-    for item in args.class_confidence_threshold:
-        for part in item.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "=" not in part:
-                raise SystemExit(f"--class-confidence-threshold expects LABEL=VALUE, got: {part!r}")
-            label, value = part.split("=", 1)
-            args.class_confidence_thresholds[label.strip()] = float(value)
-    return args
+    return parser.parse_args()
 
 
 def majority_vote(predictions) -> tuple[str, float, dict]:
@@ -508,7 +446,6 @@ def capture_and_classify(
     prediction_file,
     session_start: float,
     gui_queue: "queue.Queue | None" = None,
-    baseline: dict[str, tuple[float, float]] | None = None,
 ) -> None:
     """Extract features over [window_start, window_end], predict, gate on
     --confidence-threshold, log to CSV, and print -- shared by --capture-mode
@@ -519,40 +456,7 @@ def capture_and_classify(
     if result is None:
         return
     raw_prediction, raw_confidence = result
-    if raw_prediction == "resting":
-        raw_prediction = NO_GESTURE_LABEL
-    effective_threshold = args.class_confidence_thresholds.get(raw_prediction, args.confidence_threshold)
-    below_threshold = raw_confidence is not None and raw_confidence < effective_threshold
-
-    below_activity = False
-    if baseline is not None and args.min_activity_z > 0:
-        below_activity = True
-        for sensor, stream in streams.items():
-            if sensor not in baseline:
-                continue
-            score = sensor_activity_score(sensor, stream.window(window_start, window_end))
-            if score is None:
-                continue
-            mean, std = baseline[sensor]
-            if (score - mean) / std >= args.min_activity_z:
-                below_activity = False
-                break
-
-    not_settled = False
-    if baseline is not None and args.settle_window_seconds > 0:
-        settle_start = max(window_start, window_end - args.settle_window_seconds)
-        for sensor, stream in streams.items():
-            if sensor not in baseline:
-                continue
-            score = sensor_activity_score(sensor, stream.window(settle_start, window_end))
-            if score is None:
-                continue
-            mean, std = baseline[sensor]
-            if (score - mean) / std > args.max_end_activity_z:
-                not_settled = True
-                break
-
-    below_threshold = below_threshold or below_activity or not_settled
+    below_threshold = raw_confidence is not None and raw_confidence < args.confidence_threshold
     gated_prediction = NO_GESTURE_LABEL if below_threshold else raw_prediction
     vote_history.append(gated_prediction)
     if args.vote_window <= 1:
@@ -595,14 +499,7 @@ def capture_and_classify(
 
     if args.vote_window <= 1:
         conf_text = "" if raw_confidence is None else f" ({raw_confidence:.2f})"
-        if below_activity:
-            below_text = f" [below min-activity-z {args.min_activity_z:.2f}, raw guess: {raw_prediction}]"
-        elif not_settled:
-            below_text = f" [never settled by end of window, raw guess: {raw_prediction}]"
-        elif below_threshold:
-            below_text = f" [below {effective_threshold:.2f}, raw guess: {raw_prediction}]"
-        else:
-            below_text = ""
+        below_text = f" [below {args.confidence_threshold:.2f}, raw guess: {raw_prediction}]" if below_threshold else ""
         print(f"prediction: {display_prediction}{conf_text}{below_text}", flush=True)
     else:
         vote_text = "" if vote_fraction is None else f" vote={vote_fraction:.2f}"
@@ -680,8 +577,6 @@ def run_trigger_state_machine(
     baseline = calibrate_idle_baseline(streams, args)
     announce_status(f"Waiting for gesture onset (z >= {args.trigger_z_threshold})...")
     cooldown_until = 0.0
-    last_capture_end = time.monotonic()
-    showing_gesture = False
 
     while time.monotonic() < end_time and not stop_event.is_set():
         now = time.monotonic()
@@ -694,30 +589,8 @@ def run_trigger_state_machine(
             capture_end = trigger_time + args.window_seconds
             while time.monotonic() < capture_end:
                 time.sleep(0.02)
-            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), baseline=baseline, **cycle_kwargs)
+            capture_and_classify(window_start=trigger_time, window_end=time.monotonic(), **cycle_kwargs)
             cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
-            last_capture_end = time.monotonic()
-            showing_gesture = True
-        elif (
-            showing_gesture
-            and args.idle_reset_seconds > 0
-            and now - last_capture_end >= args.idle_reset_seconds
-        ):
-            print(f"prediction: {NO_GESTURE_LABEL} (idle)", flush=True)
-            if gui_queue is not None:
-                gui_queue.put(
-                    {
-                        "prediction": NO_GESTURE_LABEL,
-                        "confidence": None,
-                        "time_s": now - session_start,
-                        "raw_prediction": NO_GESTURE_LABEL,
-                        "raw_confidence": None,
-                        "below_threshold": False,
-                        "vote_fraction": None,
-                        "vote_window": args.vote_window,
-                    }
-                )
-            showing_gesture = False
 
         time.sleep(args.trigger_check_interval)
 
