@@ -74,6 +74,8 @@ def parse_args() -> argparse.Namespace:
         "using there.")
     parser.add_argument("--shake-min-amplitude", type=float, default=0.3, help="[shake detector] Same meaning as "
         "realtime_demo.py's --shake-min-amplitude.")
+    parser.add_argument("--shake-min-gyro-amplitude", type=float, default=50.0, help="[shake detector] Same "
+        "meaning as realtime_demo.py's --shake-min-gyro-amplitude -- match whatever value you're actually using there.")
     parser.add_argument("--gui", action="store_true", help="Show a big color-coded ACTIVE/idle window "
         "instead of terminal-only output.")
 

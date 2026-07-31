@@ -147,6 +147,24 @@ def parse_args() -> argparse.Namespace:
         "window required to even consider it a shake -- rejects a fast-but-tiny wiggle/noise from counting.",
     )
     parser.add_argument(
+        "--shake-min-gyro-amplitude",
+        type=float,
+        default=50.0,
+        help="[shake mode] Minimum standard deviation of gyroscope magnitude (in deg/s) within the lookback "
+        "window -- BOTH this and --shake-min-amplitude (accel) must be met, and both signals must oscillate "
+        "fast enough, before it counts as a shake. Requiring both makes it much more specific than accel "
+        "alone: a real shake has fast back-and-forth translation AND rotation, most real gestures have at "
+        "most one of those.",
+    )
+    parser.add_argument(
+        "--shake-confirm-seconds",
+        type=float,
+        default=2.0,
+        help="[shake mode] Require shake_detected() to stay true for this many CONSECUTIVE seconds before "
+        "actually activating a capture -- a single short flick doesn't count, you have to keep shaking. Set "
+        "to 0 to activate on the very first qualifying instant, like before.",
+    )
+    parser.add_argument(
         "--calibration-seconds",
         type=float,
         default=2.0,
@@ -594,13 +612,25 @@ def activity_triggered(streams: dict, baseline: dict[str, tuple[float, float]], 
     return False
 
 
+def _oscillation_rate(values: np.ndarray, window_seconds: float) -> float:
+    """Zero-crossing rate of `values` around its own window mean -- a cheap proxy for
+    'how fast is this oscillating', independent of any calibrated baseline."""
+    centered = values - np.mean(values)
+    crossings = int(np.sum(np.diff(np.sign(centered)) != 0))
+    return crossings / window_seconds
+
+
 def shake_detected(streams: dict, now: float, args: argparse.Namespace) -> bool:
     """[shake mode] True if the IMU shows a rapid, oscillating shake pattern in the last
     --shake-window-seconds -- a deliberate 'start recording' wake gesture, distinct from a
     real gesture's smoother, lower-frequency motion. No idle baseline needed (unlike
-    activity_triggered): shakes are detected by how fast acceleration magnitude oscillates
-    around its OWN window mean (zero-crossing rate), not by comparing to a calibrated resting
-    level, plus a minimum amplitude floor so a fast-but-tiny wiggle doesn't count."""
+    activity_triggered): shakes are detected by how fast BOTH acceleration magnitude AND
+    gyroscope magnitude oscillate around their own window mean (zero-crossing rate), each
+    with its own minimum-amplitude floor so a fast-but-tiny wiggle doesn't count. Requiring
+    both signals to oscillate (not just one) makes it much harder for an ordinary gesture's
+    smoother, lower-frequency motion to accidentally match -- a real hand shake has both a
+    fast back-and-forth translation (accel) and a fast back-and-forth wrist rotation (gyro);
+    most real gestures have at most one of those, not both at once."""
     if "imu" not in streams:
         return False
     window_start = now - args.shake_window_seconds
@@ -609,13 +639,21 @@ def shake_detected(streams: dict, now: float, args: argparse.Namespace) -> bool:
     samples = [s for s in samples if s is not None]
     if len(samples) < 6:
         return False
-    accel_mag = np.linalg.norm(np.array(samples)[:, :3], axis=1)
+    samples_array = np.array(samples)
+    accel_mag = np.linalg.norm(samples_array[:, :3], axis=1)
+    gyro_mag = np.linalg.norm(samples_array[:, 3:6], axis=1)
+
     if np.std(accel_mag) < args.shake_min_amplitude:
         return False
-    centered = accel_mag - np.mean(accel_mag)
-    crossings = int(np.sum(np.diff(np.sign(centered)) != 0))
-    crossing_rate = crossings / args.shake_window_seconds
-    return crossing_rate >= args.shake_min_crossings_per_second
+    if np.std(gyro_mag) < args.shake_min_gyro_amplitude:
+        return False
+
+    accel_rate = _oscillation_rate(accel_mag, args.shake_window_seconds)
+    gyro_rate = _oscillation_rate(gyro_mag, args.shake_window_seconds)
+    return (
+        accel_rate >= args.shake_min_crossings_per_second
+        and gyro_rate >= args.shake_min_crossings_per_second
+    )
 
 
 def run_trigger_state_machine(
@@ -670,13 +708,14 @@ def run_shake_capture_loop(
     cycle_kwargs: dict,
     gui_queue: "queue.Queue | None",
 ) -> None:
-    """--capture-mode shake's loop: do nothing until shake_detected() fires -- a deliberate
-    'start recording' wake gesture instead of a generic motion-above-baseline trigger, so
-    ordinary movement/repositioning can't accidentally activate a capture the way
-    --capture-mode trigger's threshold can. No calibration needed (shake detection doesn't
-    compare to an idle baseline). Once detected, capture exactly the next --window-seconds
-    (the shake itself isn't included) and classify once, then wait out
-    --trigger-cooldown-seconds before watching for a new shake."""
+    """--capture-mode shake's loop: do nothing until shake_detected() fires CONSISTENTLY for
+    --shake-confirm-seconds straight -- a deliberate 'start recording' wake gesture instead of
+    a generic motion-above-baseline trigger, so ordinary movement/repositioning (or one brief
+    accidental flick) can't accidentally activate a capture the way --capture-mode trigger's
+    threshold can. No calibration needed (shake detection doesn't compare to an idle
+    baseline). Once confirmed, capture exactly the next --window-seconds (the shake itself
+    isn't included) and classify once, then wait out --trigger-cooldown-seconds before
+    watching for a new shake."""
 
     def announce_status(text: str) -> None:
         print(text, flush=True)
@@ -686,25 +725,36 @@ def run_shake_capture_loop(
     if "imu" not in streams:
         raise SystemExit("--capture-mode shake needs IMU -- pass --imu-port.")
 
-    announce_status("Waiting for shake-to-activate (flick/shake your hand rapidly)...")
+    announce_status(
+        f"Waiting for shake-to-activate (shake/flick your hand for {args.shake_confirm_seconds:.1f}s straight)..."
+    )
     cooldown_until = 0.0
+    shake_since: float | None = None
 
     while time.monotonic() < end_time and not stop_event.is_set():
         now = time.monotonic()
         for stream in streams.values():
             stream.check_error()
 
-        if now >= cooldown_until and shake_detected(streams, now, args):
-            capture_start = now
-            announce_status(
-                f"[{capture_start - session_start:.2f}s] shake detected, "
-                f"capturing next {args.window_seconds:.1f}s..."
-            )
-            capture_end = capture_start + args.window_seconds
-            while time.monotonic() < capture_end:
-                time.sleep(0.02)
-            capture_and_classify(window_start=capture_start, window_end=time.monotonic(), **cycle_kwargs)
-            cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
+        if now < cooldown_until:
+            shake_since = None
+        elif shake_detected(streams, now, args):
+            if shake_since is None:
+                shake_since = now
+            elif now - shake_since >= args.shake_confirm_seconds:
+                capture_start = now
+                announce_status(
+                    f"[{capture_start - session_start:.2f}s] shake confirmed, "
+                    f"capturing next {args.window_seconds:.1f}s..."
+                )
+                capture_end = capture_start + args.window_seconds
+                while time.monotonic() < capture_end:
+                    time.sleep(0.02)
+                capture_and_classify(window_start=capture_start, window_end=time.monotonic(), **cycle_kwargs)
+                cooldown_until = time.monotonic() + args.trigger_cooldown_seconds
+                shake_since = None
+        else:
+            shake_since = None
 
         time.sleep(args.trigger_check_interval)
 
