@@ -27,9 +27,6 @@ TEXT_MUTED = "#6b7280"
 TEXT_DIM = "#9ca3af"
 TEXT_BRIGHT = "#f5f5f7"
 NO_GESTURE_COLOR = "#3a3f4b"
-UNKNOWN_GESTURE_COLOR = "#f4a261"  # amber -- deliberately distinct from NO_GESTURE_COLOR: movement WAS
-# confirmed, the classifier just isn't sure which gesture, which is a different situation than no
-# movement having happened at all (see realtime_demo.py's NO_GESTURE_LABEL vs UNKNOWN_GESTURE_LABEL).
 LIVE_GREEN = "#2ecc71"
 
 # Distinct, readable-on-dark-background hues -- cycled per gesture label so
@@ -81,10 +78,8 @@ class RealtimeGestureGUI:
         gesture_labels: list[str],
         no_gesture_label: str,
         duration_s: float | None = None,
-        unknown_gesture_label: str | None = None,
     ):
         self.no_gesture_label = no_gesture_label
-        self.unknown_gesture_label = unknown_gesture_label
         self.total_duration_s = duration_s
         self.palette = {
             label: ACCENT_PALETTE[i % len(ACCENT_PALETTE)] for i, label in enumerate(sorted(gesture_labels))
@@ -186,8 +181,6 @@ class RealtimeGestureGUI:
     def _color_for(self, label: str) -> str:
         if label == self.no_gesture_label:
             return NO_GESTURE_COLOR
-        if label == self.unknown_gesture_label:
-            return UNKNOWN_GESTURE_COLOR
         return self.palette.get(label, NO_GESTURE_COLOR)
 
     def _on_stage_resize(self, event) -> None:
