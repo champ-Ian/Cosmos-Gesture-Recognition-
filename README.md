@@ -529,6 +529,34 @@ Trains on every collector except `student03` and tests only on their trials
 -- compare this accuracy against a random train/test split to see whether
 the model generalizes to a person it never saw.
 
+### Leave-one-subject-out sweep (reproducing the paper's tables)
+
+`train.py` only supports a single train/test split or a single
+`--test-collector` holdout; it doesn't rotate through every collector and pool
+the results. `loso_sweep.py` does that: it holds out each collector in turn,
+trains on the rest, and pools every held-out prediction into one accuracy/confusion
+matrix -- this is the methodology behind the paper's Model Comparison and
+Modality Ablation tables.
+
+```bash
+# One config, e.g. mmWave-only under early fusion:
+python src/loso_sweep.py --sensors mmwave --fusion early --classifier random_forest
+
+# Every row of the Modality Ablation table (single-sensor, pairwise, 3-sensor,
+# early and late where applicable):
+python src/loso_sweep.py --ablation
+
+# The Model Comparison table (Random Forest early/late, kNN, feature-vector CNN):
+python src/loso_sweep.py --model-comparison
+
+# Add --output results.json to any of the above to save accuracy + full confusion
+# matrices per config.
+```
+
+Run against `src/features_augmented.csv` by default (override with
+`--features-csv`); reproduces 92.5%/96.1% (Random Forest late/early, 3-sensor)
+and every Modality Ablation row exactly.
+
 ### Evaluating an already-trained model
 
 `evaluate.py` loads a saved model and reports metrics against a dataset
