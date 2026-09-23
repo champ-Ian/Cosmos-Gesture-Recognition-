@@ -1,0 +1,179 @@
+{
+  "features_csv": "/Users/vibhamandayam/OpenCS/Cosmos-Gesture-Recognition-/src/features_clean7.csv",
+  "classifier": "random_forest",
+  "n_collectors": 7,
+  "test_size": 2,
+  "n_splits": 21,
+  "mean_accuracy": 0.9195869742221523,
+  "std_accuracy": 0.0439408737207165,
+  "splits": [
+    {
+      "test_collectors": [
+        "andrew",
+        "brandon"
+      ],
+      "accuracy": 0.945,
+      "n_test": 1000
+    },
+    {
+      "test_collectors": [
+        "andrew",
+        "iris"
+      ],
+      "accuracy": 0.991504854368932,
+      "n_test": 824
+    },
+    {
+      "test_collectors": [
+        "andrew",
+        "leudies"
+      ],
+      "accuracy": 0.9491701244813278,
+      "n_test": 964
+    },
+    {
+      "test_collectors": [
+        "andrew",
+        "peter"
+      ],
+      "accuracy": 0.887,
+      "n_test": 1000
+    },
+    {
+      "test_collectors": [
+        "andrew",
+        "tyler"
+      ],
+      "accuracy": 0.934,
+      "n_test": 1000
+    },
+    {
+      "test_collectors": [
+        "andrew",
+        "vibha"
+      ],
+      "accuracy": 0.9817073170731707,
+      "n_test": 820
+    },
+    {
+      "test_collectors": [
+        "brandon",
+        "iris"
+      ],
+      "accuracy": 0.8980582524271845,
+      "n_test": 824
+    },
+    {
+      "test_collectors": [
+        "brandon",
+        "leudies"
+      ],
+      "accuracy": 0.9315352697095436,
+      "n_test": 964
+    },
+    {
+      "test_collectors": [
+        "brandon",
+        "peter"
+      ],
+      "accuracy": 0.871,
+      "n_test": 1000
+    },
+    {
+      "test_collectors": [
+        "brandon",
+        "tyler"
+      ],
+      "accuracy": 0.909,
+      "n_test": 1000
+    },
+    {
+      "test_collectors": [
+        "brandon",
+        "vibha"
+      ],
+      "accuracy": 0.8987804878048781,
+      "n_test": 820
+    },
+    {
+      "test_collectors": [
+        "iris",
+        "leudies"
+      ],
+      "accuracy": 0.949238578680203,
+      "n_test": 788
+    },
+    {
+      "test_collectors": [
+        "iris",
+        "peter"
+      ],
+      "accuracy": 0.8652912621359223,
+      "n_test": 824
+    },
+    {
+      "test_collectors": [
+        "iris",
+        "tyler"
+      ],
+      "accuracy": 0.970873786407767,
+      "n_test": 824
+    },
+    {
+      "test_collectors": [
+        "iris",
+        "vibha"
+      ],
+      "accuracy": 0.9751552795031055,
+      "n_test": 644
+    },
+    {
+      "test_collectors": [
+        "leudies",
+        "peter"
+      ],
+      "accuracy": 0.8630705394190872,
+      "n_test": 964
+    },
+    {
+      "test_collectors": [
+        "leudies",
+        "tyler"
+      ],
+      "accuracy": 0.9533195020746889,
+      "n_test": 964
+    },
+    {
+      "test_collectors": [
+        "leudies",
+        "vibha"
+      ],
+      "accuracy": 0.9158163265306123,
+      "n_test": 784
+    },
+    {
+      "test_collectors": [
+        "peter",
+        "tyler"
+      ],
+      "accuracy": 0.834,
+      "n_test": 1000
+    },
+    {
+      "test_collectors": [
+        "peter",
+        "vibha"
+      ],
+      "accuracy": 0.8573170731707317,
+      "n_test": 820
+    },
+    {
+      "test_collectors": [
+        "tyler",
+        "vibha"
+      ],
+      "accuracy": 0.9304878048780488,
+      "n_test": 820
+    }
+  ]
+}

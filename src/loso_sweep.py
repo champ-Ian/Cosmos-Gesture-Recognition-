@@ -14,10 +14,22 @@ collector and pool the results. This script reuses `train.py`'s own
 the held-out fold" aggregation.
 
 This is the methodology behind the paper's Model Comparison and Modality
-Ablation tables (leave-one-subject-out across all ten collectors on
-features_augmented.csv). `--ablation` reproduces every row of the Modality
-Ablation table; `--model-comparison` reproduces the Random Forest / kNN / CNN
-numbers in Model Comparison.
+Ablation tables (leave-one-subject-out across the 7 fully-independent
+collectors on features_clean7.csv -- see the "Fix collector-collision
+leakage" note below for why it's 7, not 10). `--ablation` reproduces every
+row of the Modality Ablation table; `--model-comparison` reproduces the
+Random Forest / kNN / Linear SVM / CNN numbers in Model Comparison.
+
+Fix collector-collision leakage: features_augmented.csv (the old default)
+still contained three collectors (ian/joanna/kaiwei) whose raw sessions had
+been recorded under a shared placeholder label and so overwrote one another
+on disk -- their rows are byte-identical duplicates of a single surviving
+recording. Under LOSO that means holding out "ian" still leaves identical
+rows for "joanna"/"kaiwei" in the training fold: direct train/test leakage.
+features_clean7.csv already excludes every row traceable to that collision
+(7 collectors, 3108 rows including augmentation), matching the paper's
+Data Collection Protocol section. Do not point --features-csv back at
+features_augmented.csv.
 
 Usage (run from the repo root):
     python src/loso_sweep.py --sensors mmwave,imu,uwb --fusion early --classifier random_forest
@@ -36,9 +48,18 @@ import numpy as np
 from train import read_features_csv
 from gesture_models import build_classifier, LateFusionClassifier
 
-DEFAULT_FEATURES_CSV = Path(__file__).parent / "features_augmented.csv"
+DEFAULT_FEATURES_CSV = Path(__file__).parent / "features_clean7.csv"
+DEFAULT_FEATURES_CSV_NOAUG = Path(__file__).parent / "features_clean7_noaug.csv"
 ALL_SENSORS = ["mmwave", "imu", "uwb"]
 RANDOM_STATE = 42
+
+# All 4 classifiers x 2 fusion strategies, run on both the augmented and
+# non-augmented feature tables -- the early/late-fusion x augmented/normal
+# half of the paper's claimed "32 total configurations" (the other half,
+# hand-engineered-feature vs. raw-sequence, needs the raw per-trial
+# trial_data.npz files, which aren't present in this repo -- see README).
+FULL_GRID_CLASSIFIERS = ["random_forest", "knn", "svm_linear", "cnn"]
+FULL_GRID_FUSIONS = ["early", "late"]
 
 # Every row of the paper's Modality Ablation table (sensors, fusion, classifier).
 # Single-sensor rows use "early" since early/late fusion are equivalent with one sensor.
@@ -57,11 +78,13 @@ ABLATION_ROWS = [
 ]
 
 # The paper's Model Comparison numbers: RF early/late (isolates fusion strategy),
-# kNN and the feature-vector CNN under early fusion.
+# kNN, Linear SVM, and the feature-vector CNN under early fusion -- all four
+# classifiers named in Methods ("four different machine learning models").
 MODEL_COMPARISON_ROWS = [
     ("random_forest", "early"),
     ("random_forest", "late"),
     ("knn", "early"),
+    ("svm_linear", "early"),
     ("cnn", "early"),
 ]
 
@@ -71,9 +94,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--features-csv", default=str(DEFAULT_FEATURES_CSV), help="Flat feature table from export_features_csv.py.")
     parser.add_argument("--sensors", help="Comma-separated sensor subset, e.g. 'mmwave' or 'mmwave,imu,uwb'.")
     parser.add_argument("--fusion", choices=["early", "late"], default="early")
-    parser.add_argument("--classifier", choices=["random_forest", "knn", "cnn"], default="random_forest")
+    parser.add_argument("--classifier", choices=["random_forest", "knn", "svm_linear", "cnn"], default="random_forest")
     parser.add_argument("--ablation", action="store_true", help="Run every row of the Modality Ablation table.")
-    parser.add_argument("--model-comparison", action="store_true", help="Run the Model Comparison table (RF/kNN/CNN).")
+    parser.add_argument("--model-comparison", action="store_true", help="Run the Model Comparison table (RF/kNN/SVM/CNN).")
+    parser.add_argument(
+        "--full-grid",
+        action="store_true",
+        help="Run all 4 classifiers x 2 fusion strategies x {augmented, non-augmented} (16 configs) on "
+        "all three sensors. Uses --features-csv for the augmented half and --features-csv-noaug for the "
+        "non-augmented half. This is the early/late x augmented/normal half of the paper's claimed "
+        "32-config grid; the feature/raw half needs raw per-trial data not present in this repo.",
+    )
+    parser.add_argument("--features-csv-noaug", default=str(DEFAULT_FEATURES_CSV_NOAUG), help="Non-augmented counterpart of --features-csv, used by --full-grid.")
     parser.add_argument("--output", help="Optional path to write results as JSON.")
     return parser.parse_args()
 
@@ -150,6 +182,21 @@ def main() -> int:
 
     results: dict[str, dict] = {}
 
+    if args.full_grid:
+        noaug_csv = Path(args.features_csv_noaug).expanduser().resolve()
+        noaug_X, noaug_y, noaug_collectors, noaug_labels_order = load_data(noaug_csv)
+        print(f"Loaded {len(noaug_y)} rows, {len(noaug_labels_order)} classes, {len(set(noaug_collectors))} collectors from {noaug_csv}")
+
+        print("\n=== Full Grid (early/late x augmented/normal, all 3 sensors) ===")
+        datasets = [("augmented", per_sensor_X, y, collectors_arr, labels_order), ("normal", noaug_X, noaug_y, noaug_collectors, noaug_labels_order)]
+        for aug_label, X, yy, cc, lo in datasets:
+            for classifier in FULL_GRID_CLASSIFIERS:
+                for fusion in FULL_GRID_FUSIONS:
+                    acc, matrix, n = run_loso(ALL_SENSORS, fusion, classifier, X, yy, cc, lo)
+                    key = f"{classifier}_{fusion}_{aug_label}"
+                    print(f"{classifier:15s} {fusion:6s} {aug_label:10s} accuracy = {acc*100:.2f}%  n={n}")
+                    results[key] = {"sensors": ALL_SENSORS, "fusion": fusion, "classifier": classifier, "augmentation": aug_label, "accuracy": acc, "n": n, "matrix": matrix.tolist()}
+
     if args.ablation:
         print("\n=== Modality Ablation ===")
         for sensors, fusion in ABLATION_ROWS:
@@ -166,7 +213,7 @@ def main() -> int:
             print(f"{classifier:15s} {fusion:6s} accuracy = {acc*100:.2f}%  n={n}")
             results[key] = {"sensors": ALL_SENSORS, "fusion": fusion, "classifier": classifier, "accuracy": acc, "n": n, "matrix": matrix.tolist()}
 
-    if not args.ablation and not args.model_comparison:
+    if not args.ablation and not args.model_comparison and not args.full_grid:
         if not args.sensors:
             raise SystemExit("Pass --sensors (or use --ablation / --model-comparison).")
         sensors = [s.strip().lower() for s in args.sensors.split(",") if s.strip()]

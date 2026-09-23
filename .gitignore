@@ -25,5 +25,7 @@ logs/
 *.npz
 *.confusion.png
 *.json
+!results/figures/loso_*.json
+!results/figures/heldout_collector_*.json
 *.joblib
 raw/
