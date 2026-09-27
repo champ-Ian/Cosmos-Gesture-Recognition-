@@ -28,7 +28,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, confusion_matrix
 
 from loso_sweep import ALL_SENSORS, load_data
 
@@ -127,6 +127,7 @@ def main() -> int:
     fold_accs = [f["outer_fold_accuracy"] for f in fold_results]
     mean_acc = float(np.mean(fold_accs))
     std_acc = float(np.std(fold_accs))
+    pooled_matrix = confusion_matrix(all_true, all_pred, labels=labels_order)
 
     print(f"\nPooled accuracy (all {len(all_true)} held-out predictions): {pooled_acc*100:.2f}%")
     print(f"Mean of per-fold accuracy: {mean_acc*100:.2f}% +/- {std_acc*100:.2f}% (std across {len(fold_accs)} folds)")
@@ -137,9 +138,13 @@ def main() -> int:
             "features_csv": args.features_csv,
             "n_rows": len(y),
             "n_collectors": len(unique_collectors),
+            "labels_order": labels_order,
             "pooled_accuracy": pooled_acc,
             "mean_fold_accuracy": mean_acc,
             "std_fold_accuracy": std_acc,
+            "pooled_matrix": pooled_matrix.tolist(),
+            "all_true": list(all_true),
+            "all_pred": list(all_pred),
             "fold_results": fold_results,
         }, indent=2))
         print(f"Wrote {args.output}")
